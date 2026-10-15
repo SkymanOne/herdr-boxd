@@ -2,11 +2,18 @@
 
 Start a [boxd](https://boxd.sh) machine from a snapshot and attach it in [Herdr](https://herdr.dev). Other agents can also use it to run coding subagents inside boxd machines and keep track of them.
 
-It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer. Rust is needed only to build the plugin from source.
+It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer, or to be inside a boxd VM. Rust and protoc are needed only to build from source when no release binary is available.
 
 ## Install
 
-Apple Silicon or Linux x86_64, including a boxd VM:
+Plugin. Pin a release with `--ref v0.2.0`. If this directory was linked, unlink it first:
+
+```bash
+herdr plugin unlink boxd.session
+herdr plugin install SkymanOne/herdr-boxd --ref v0.2.0
+```
+
+CLI only, on Apple Silicon or Linux x86_64, including a boxd VM:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SkymanOne/herdr-boxd/main/install.sh | sh
@@ -20,14 +27,11 @@ boxd machine exec <vm> -- sh -c 'curl -fsSL https://raw.githubusercontent.com/Sk
 
 `HERDR_BOXD_VERSION` selects a release. `HERDR_BOXD_INSTALL_DIR` defaults to `~/.local/bin`.
 
-The Herdr plugin on a Mac still uses `herdr plugin link` from a source checkout. The install script only puts the CLI on `PATH`.
-
-From this directory:
+Development uses a source checkout:
 
 ```bash
 cargo build --release --locked
 herdr plugin link .
-ln -sf "$PWD/target/release/herdr-boxd" ~/.local/bin/herdr-boxd   # so agents can call it
 ```
 
 Bind a key in `~/.config/herdr/config.toml` (`prefix+b` is the sidebar):
@@ -110,7 +114,7 @@ With `--json`, errors are `{"error":{"code","message"}}` on stderr. The exit cod
 
 ## Configuration and auth
 
-The snapshot name defaults to `herd-base`. Auth uses the token from `boxd auth login`. If that token is rejected, set an API key. The config file is written atomically with mode `600`. The key goes to the token exchange over stdin, so it never appears in `ps`.
+The snapshot name defaults to `herd-base`. Auth is the first of: a stored API key, `BOXD_TOKEN`, `BOXD_API_KEY`, `boxd auth login`, or a token minted automatically inside a boxd VM. The key goes to the token exchange over stdin, so it never appears in `ps`. `config show` reports which source was used.
 
 It only manages machines it created, and it updates the snapshot only when asked.
 

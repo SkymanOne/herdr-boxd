@@ -15,6 +15,14 @@ jobs:
           components: rustfmt, clippy
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Plugin version matches Cargo.toml
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          plugin_version=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml)
+          if [ "$cargo_version" != "$plugin_version" ]; then
+            echo "herdr-plugin.toml $plugin_version != Cargo.toml $cargo_version"
+            exit 1
+          fi
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
