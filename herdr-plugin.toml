@@ -1,0 +1,48 @@
+id = "boxd.session"
+name = "Boxd"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Start a boxd machine from a snapshot and connect it in Herdr"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "menu"
+title = "Boxd"
+contexts = ["global", "workspace", "pane"]
+command = ["target/release/herdr-boxd", "open-menu"]
+
+[[actions]]
+id = "start"
+title = "Start boxd session"
+contexts = ["global", "workspace", "pane"]
+command = ["target/release/herdr-boxd", "open-menu", "start"]
+
+[[actions]]
+id = "configure"
+title = "Configure boxd snapshot"
+contexts = ["global"]
+command = ["target/release/herdr-boxd", "open-menu", "configure"]
+
+[[actions]]
+id = "update"
+title = "Update boxd snapshot"
+contexts = ["global"]
+command = ["target/release/herdr-boxd", "open-menu", "update"]
+
+[[actions]]
+id = "destroy"
+title = "Destroy boxd machine"
+contexts = ["global"]
+command = ["target/release/herdr-boxd", "open-menu", "destroy"]
+
+[[panes]]
+id = "menu"
+title = "Boxd"
+placement = "popup"
+width = "72%"
+height = 22
+command = ["target/release/herdr-boxd", "menu"]
