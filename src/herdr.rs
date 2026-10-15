@@ -313,6 +313,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_matches_only_our_label_and_alias() {
+        let ours = Profile {
+            id: "m1".into(),
+            label: "hb-1".into(),
+            target: ssh::alias("hb-1"),
+        };
+        assert!(ours.is_for("hb-1"));
+        assert!(!ours.is_for("other"));
+        let user = Profile {
+            id: "m2".into(),
+            label: "hb-1".into(),
+            target: "user@host".into(),
+        };
+        assert!(!user.is_for("hb-1"));
+    }
+
+    #[test]
     fn version_parses_herdr_output() {
         assert_eq!(parse_version("herdr 0.9.5"), Some((0, 9, 5)));
         assert_eq!(parse_version("herdr v0.9.0"), Some((0, 9, 0)));
