@@ -134,8 +134,10 @@ A machine can run herdr-boxd itself (a "master"), so machines form a tree.
 `list` nests each machine's own machines under `children`, three levels deep.
 It never wakes a sleeping machine. A running machine whose machines could not
 be read has `unreachable` set. In `agent list`, an agent that another
-machine manages has `host` set: run `agent` commands for it on that host, for
-example with `boxd machine exec <host> -- ~/.local/bin/herdr-boxd --json agent read <name>`.
+machine manages has `host` set. Use the usual commands on it anyway. `agent
+status/wait/read/prompt/keys/stop`, `attach` and `destroy` run on the managing
+host for you, with the same JSON and exit codes. Two agents with one name on
+different hosts give `ambiguous`.
 Inside a boxd VM, SSH to the machines it creates needs no setup; the plugin
 handles the key.
 
@@ -144,6 +146,6 @@ handles the key.
 `usage`, `auth` (API key, `BOXD_TOKEN`, `BOXD_API_KEY`, `boxd auth login`, or a boxd VM), `quota`,
 `already_exists`, `not_found`, `not_owned`, `snapshot_not_found`, `busy`,
 `timeout`, `agent_not_ready`, `unavailable` and `unreachable` (retry),
-`ssh_unreachable`, `machine_gone`, `herdr_missing` (use `--headless`), `herdr_old` (install Herdr 0.9.1 or newer), `workdir_in_use` (another agent works in
+`ssh_unreachable`, `machine_gone`, `ambiguous`, `herdr_missing` (use `--headless`), `herdr_old` (install Herdr 0.9.1 or newer), `workdir_in_use` (another agent works in
 that directory; share it with `--workdir` instead of copying over it),
 `cancelled`.

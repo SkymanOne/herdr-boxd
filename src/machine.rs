@@ -302,11 +302,15 @@ async fn connect_ssh(client: &mut boxd::Client, name: &str, vm: &GetVmResponse) 
 /// key is pinned from that same exec, before the first connection.
 async fn connect_private(client: &mut boxd::Client, name: &str, pubkey: &str) -> Result<()> {
     let script = format!("KEY={}\n{SSHD_SETUP}", crate::agent::sh_quote(pubkey));
-    let host_key = client
-        .exec(name, &script)
-        .await?
-        .check("setting up SSH")?
-        .stdout_text();
+    // Right after a boot (a resize reboots) systemd may not answer yet.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let host_key = loop {
+        match client.exec(name, &script).await?.check("setting up SSH") {
+            Ok(output) => break output.stdout_text(),
+            Err(err) if tokio::time::Instant::now() >= deadline => return Err(err),
+            Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    };
     let host_key = host_key.trim();
     if !host_key.starts_with("ssh-") {
         bail!("{name} printed no SSH host key");
@@ -360,7 +364,9 @@ pub fn require_owned(name: &str) -> Result<()> {
     }
     bail!(Coded::new(
         "not_owned",
-        format!("{name} was not created by herdr-boxd; it only manages its own machines"),
+        format!(
+            "{name} is not in this host's herdr-boxd ledger; `herdr-boxd list` shows which machine manages it"
+        ),
     ));
 }
 

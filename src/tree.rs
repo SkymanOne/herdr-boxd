@@ -140,7 +140,12 @@ pub async fn descendants(client: &mut boxd::Client, name: &str) -> Result<Vec<Li
 /// Agents of every host in the tree that runs herdr-boxd, tagged with `host`.
 pub async fn remote_agents(client: &mut boxd::Client) -> Result<Vec<Value>> {
     let tree = list(client).await?;
-    let hosts: Vec<String> = deepest_first(&tree)
+    remote_agents_of(client, &tree).await
+}
+
+/// `remote_agents` for a tree already listed.
+pub async fn remote_agents_of(client: &mut boxd::Client, tree: &[Listed]) -> Result<Vec<Value>> {
+    let hosts: Vec<String> = deepest_first(tree)
         .into_iter()
         .filter(|node| node.manages)
         .map(|node| node.name.clone())
@@ -264,6 +269,148 @@ pub async fn sync_best_effort(client: &mut boxd::Client) {
     }
 }
 
+/// Where a command on a machine or agent runs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Route {
+    /// This host's ledger has it.
+    Local,
+    /// That host's ledger has it; run the command there.
+    Host(String),
+    /// Several hosts have an agent by that name.
+    Ambiguous(Vec<String>),
+    /// No reachable ledger has it.
+    Missing,
+}
+
+/// A machine is managed by the host that created it: its parent in the tree.
+pub fn machine_route(name: &str, owned_here: bool, tree: &[Listed]) -> Route {
+    if owned_here {
+        return Route::Local;
+    }
+    // Roots come from this host's ledger, so only nested nodes are elsewhere.
+    let mut nested = tree.iter().flat_map(|root| deepest_first(&root.children));
+    match nested.find(|node| node.name == name) {
+        Some(node) if !node.parent.is_empty() => Route::Host(node.parent.clone()),
+        _ => Route::Missing,
+    }
+}
+
+/// An agent is managed by the host whose ledger lists it (`host` in
+/// `remote_agents`).
+pub fn agent_route(name: &str, here: bool, remote: &[Value]) -> Route {
+    if here {
+        return Route::Local;
+    }
+    let mut hosts: Vec<String> = remote
+        .iter()
+        .filter(|agent| agent["agent"] == name)
+        .filter_map(|agent| agent["host"].as_str().map(str::to_owned))
+        .collect();
+    hosts.dedup();
+    match hosts.len() {
+        0 => Route::Missing,
+        1 => Route::Host(hosts.remove(0)),
+        _ => Route::Ambiguous(hosts),
+    }
+}
+
+/// Machines in the tree whose own ledgers could not be read.
+pub fn unsearched(tree: &[Listed]) -> Vec<String> {
+    deepest_first(tree)
+        .into_iter()
+        .filter(|node| {
+            node.unreachable.is_some() || (node.status != "running" && node.status != "gone")
+        })
+        .map(|node| node.name.clone())
+        .collect()
+}
+
+/// The error for a machine or agent no reachable ledger has.
+pub fn missing(code: &'static str, what: &str, tree: &[Listed]) -> anyhow::Error {
+    let asleep = unsearched(tree);
+    let hint = if asleep.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; not searched (asleep or unreachable): {}",
+            asleep.join(", ")
+        )
+    };
+    Coded::new(
+        code,
+        format!("no herdr-boxd ledger reachable from here has {what}{hint}"),
+    )
+    .into()
+}
+
+/// Runs `herdr-boxd --json ARGS` on `host`, the machine whose ledger has the
+/// target, and returns its JSON reply. Its error comes back with the same
+/// code, so the exit code matches a local call. Its progress lines are shown.
+pub async fn delegate(client: &mut boxd::Client, host: &str, args: &[String]) -> Result<Value> {
+    machine::check_machine_name(host)?;
+    let quoted: Vec<String> = args.iter().map(|arg| crate::agent::sh_quote(arg)).collect();
+    let command = format!(
+        "p=\"${{HOME:-/home/boxd}}/.local/bin/herdr-boxd\"; [ -x \"$p\" ] || p=$(command -v herdr-boxd) || exit 127; \
+         {DEPTH_ENV}=0 BOXD_VM_NAME={host} exec \"$p\" --json {}",
+        quoted.join(" ")
+    );
+    ui::step(format!("running on {host}, which manages it"));
+    let output = client.exec(host, &command).await?;
+    if output.code == 127 {
+        bail!(Coded::new(
+            "unreachable",
+            format!("herdr-boxd is not installed on {host}"),
+        ));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut error = None;
+    for line in stderr.lines() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) if value.get("error").is_some() => error = Some(value),
+            _ if !line.trim().is_empty() => eprintln!("{line}"),
+            _ => {}
+        }
+    }
+    if output.code != 0 {
+        let (code, message) = error
+            .as_ref()
+            .and_then(|value| {
+                Some((
+                    value["error"]["code"].as_str()?.to_owned(),
+                    value["error"]["message"].as_str()?.to_owned(),
+                ))
+            })
+            .unwrap_or_else(|| {
+                (
+                    "remote_failed".into(),
+                    format!("herdr-boxd on {host} exited {}", output.code),
+                )
+            });
+        bail!(Coded::owned(code, message));
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("herdr-boxd on {host} printed non-JSON output"))
+}
+
+/// After a delegated destroy: drop what `sync` added here for those machines.
+pub fn forget_here(names: &[String]) {
+    for name in names {
+        if let Err(err) = herdr::remove_profile(name) {
+            ui::warn(format!(
+                "could not remove the Herdr profile of {name}: {err:#}"
+            ));
+        }
+        let _ = ssh::remove(name);
+    }
+}
+
+/// The node for `name` anywhere in the tree.
+pub fn find<'a>(tree: &'a [Listed], name: &str) -> Option<&'a Listed> {
+    deepest_first(tree)
+        .into_iter()
+        .find(|node| node.name == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +427,63 @@ mod tests {
             unreachable: None,
             manages: false,
         }
+    }
+
+    fn child(name: &str, parent: &str, children: Vec<Listed>) -> Listed {
+        Listed {
+            parent: parent.into(),
+            ..node(name, children)
+        }
+    }
+
+    #[test]
+    fn machines_route_to_the_host_that_created_them() {
+        let tree = vec![child(
+            "master",
+            "",
+            vec![child("kid", "master", vec![child("grand", "kid", vec![])])],
+        )];
+        assert_eq!(machine_route("master", true, &tree), Route::Local);
+        assert_eq!(
+            machine_route("kid", false, &tree),
+            Route::Host("master".into())
+        );
+        assert_eq!(
+            machine_route("grand", false, &tree),
+            Route::Host("kid".into())
+        );
+        assert_eq!(machine_route("nope", false, &tree), Route::Missing);
+        // A root that is not in the ledger (removed meanwhile) is not elsewhere.
+        assert_eq!(machine_route("master", false, &tree), Route::Missing);
+    }
+
+    #[test]
+    fn agents_route_to_the_host_whose_ledger_has_them() {
+        let remote = vec![
+            json!({"agent": "a", "host": "kid"}),
+            json!({"agent": "b", "host": "kid"}),
+            json!({"agent": "b", "host": "grand"}),
+            json!({"host": "dead", "status": "unreachable"}),
+        ];
+        assert_eq!(agent_route("a", true, &remote), Route::Local);
+        assert_eq!(agent_route("a", false, &remote), Route::Host("kid".into()));
+        assert_eq!(
+            agent_route("b", false, &remote),
+            Route::Ambiguous(vec!["kid".into(), "grand".into()])
+        );
+        assert_eq!(agent_route("c", false, &remote), Route::Missing);
+    }
+
+    #[test]
+    fn unsearched_names_sleeping_and_unreachable_machines() {
+        let mut asleep = node("asleep", vec![]);
+        asleep.status = "suspended".into();
+        let mut broken = node("broken", vec![]);
+        broken.unreachable = Some("timeout".into());
+        let mut gone = node("gone", vec![]);
+        gone.status = "gone".into();
+        let tree = vec![node("ok", vec![asleep, broken]), gone];
+        assert_eq!(unsearched(&tree), ["asleep", "broken"]);
     }
 
     #[test]

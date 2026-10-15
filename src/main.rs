@@ -510,8 +510,14 @@ fn ask_machine_name() -> Result<Option<String>> {
 async fn attach_cmd(raw: Vec<String>) -> Result<()> {
     let mut args = Args::parse(raw, &[], &[])?;
     let name = args.one("machine name")?;
-    machine::require_owned(&name)?;
     let mut client = machine::connect().await?;
+    if let Some(host) = machine_host(&mut client, &name).await? {
+        // The host wakes it and fixes its own Herdr; then it joins ours.
+        if !herdr::available() {
+            return Err(herdr::missing());
+        }
+        tree::delegate(&mut client, &host, &argv(&["attach", &name])).await?;
+    }
     let profile = machine::attach(&mut client, &name).await?;
     if ui::json() {
         ui::print_json(&json!({ "machine": name, "profile": profile }));
@@ -620,22 +626,72 @@ async fn update_cmd(raw: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// None when this host's ledger has `name`; otherwise the machine in the tree
+/// whose ledger does.
+async fn machine_host(client: &mut boxd::Client, name: &str) -> Result<Option<String>> {
+    if store::owns(&store::dirs(), name) {
+        return Ok(None);
+    }
+    let tree = tree::list(client).await?;
+    match tree::machine_route(name, false, &tree) {
+        tree::Route::Host(host) => Ok(Some(host)),
+        _ => Err(tree::missing(
+            "not_owned",
+            &format!("a machine named {name}"),
+            &tree,
+        )),
+    }
+}
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+fn strings(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str().map(str::to_owned))
+        .collect()
+}
+
 async fn destroy_cmd(raw: Vec<String>) -> Result<()> {
     let mut args = Args::parse(raw, &[], &["yes"])?;
     let name = args.one("machine name")?;
-    machine::require_owned(&name)?;
     // Fail before the walk below wakes anything.
     if !args.flag("yes") && !ui::interactive() {
         return Err(usage("this is destructive; pass --yes to confirm"));
     }
     let mut client = machine::connect().await?;
-    let below = tree::descendants(&mut client, &name).await?;
-    confirm_or_yes(args.flag("yes"), &destroy_question(&name, &below))?;
-    let existed = machine::destroy_tree(&mut client, &name, &below).await?;
-    let descendants: Vec<&str> = tree::deepest_first(&below)
-        .into_iter()
-        .map(|node| node.name.as_str())
-        .collect();
+    let (existed, descendants) = match machine_host(&mut client, &name).await? {
+        None => {
+            let below = tree::descendants(&mut client, &name).await?;
+            confirm_or_yes(args.flag("yes"), &destroy_question(&name, &below))?;
+            let existed = machine::destroy_tree(&mut client, &name, &below).await?;
+            let descendants: Vec<String> = tree::deepest_first(&below)
+                .into_iter()
+                .map(|node| node.name.clone())
+                .collect();
+            (existed, descendants)
+        }
+        Some(host) => {
+            // The host that made it destroys it, cascades, and cleans its own
+            // ledger; here only what `sync` added is left to remove.
+            let tree = tree::list(&mut client).await?;
+            let below = tree::find(&tree, &name)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            confirm_or_yes(args.flag("yes"), &destroy_question(&name, &below))?;
+            let value =
+                tree::delegate(&mut client, &host, &argv(&["destroy", &name, "--yes"])).await?;
+            let descendants = strings(&value["descendants"]);
+            let mut gone = descendants.clone();
+            gone.push(name.clone());
+            tree::forget_here(&gone);
+            (value["destroyed"] == true, descendants)
+        }
+    };
     if ui::json() {
         ui::print_json(
             &json!({ "machine": name, "destroyed": existed, "descendants": descendants }),
@@ -782,19 +838,34 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
         }
         "status" | "get" => {
             let mut args = Args::parse(raw, &[], &[])?;
-            let agent = agent::find(&args.one("agent name")?)?;
+            let name = args.one("agent name")?;
             let mut client = machine::connect().await?;
-            emit(agent::status(&mut client, &agent).await?);
+            emit(match locate(&mut client, &name).await? {
+                Located::Here(agent) => agent::status(&mut client, &agent).await?,
+                Located::On(host, _) => {
+                    tree::delegate(&mut client, &host, &argv(&["agent", "status", &name])).await?
+                }
+            });
         }
         "wait" => {
             let mut args = Args::parse(raw, &["timeout"], &[])?;
-            let agent = agent::find(&args.one("agent name")?)?;
+            let name = args.one("agent name")?;
+            let timeout = args.timeout_ms()?;
             let mut client = machine::connect().await?;
-            emit(agent::wait(&mut client, &agent, args.timeout_ms()?).await?);
+            emit(match locate(&mut client, &name).await? {
+                Located::Here(agent) => agent::wait(&mut client, &agent, timeout).await?,
+                Located::On(host, _) => {
+                    let mut remote = argv(&["agent", "wait", &name]);
+                    if let Some(ms) = timeout {
+                        remote.extend(["--timeout".into(), ms.to_string()]);
+                    }
+                    tree::delegate(&mut client, &host, &remote).await?
+                }
+            });
         }
         "read" | "logs" => {
             let mut args = Args::parse(raw, &["lines"], &[])?;
-            let agent = agent::find(&args.one("agent name")?)?;
+            let name = args.one("agent name")?;
             let lines = args
                 .opt("lines")
                 .map(|raw| raw.parse().map_err(|_| usage("--lines must be a number")))
@@ -802,7 +873,13 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
                 .unwrap_or(120u32)
                 .clamp(1, 10_000);
             let mut client = machine::connect().await?;
-            let value = agent::read(&mut client, &agent, lines).await?;
+            let value = match locate(&mut client, &name).await? {
+                Located::Here(agent) => agent::read(&mut client, &agent, lines).await?,
+                Located::On(host, _) => {
+                    let remote = argv(&["agent", "read", &name, "--lines", &lines.to_string()]);
+                    tree::delegate(&mut client, &host, &remote).await?
+                }
+            };
             if ui::json() {
                 ui::print_json(&value);
             } else {
@@ -816,7 +893,7 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
             }
         }
         "prompt" | "send" => {
-            let mut args = Args::parse(raw, &["prompt-file", "timeout"], &["wait"])?;
+            let mut args = Args::parse(raw, &["prompt", "prompt-file", "timeout"], &["wait"])?;
             let name = args
                 .pos
                 .pop_front()
@@ -824,18 +901,30 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
             let inline = args.pos.drain(..).collect::<Vec<_>>().join(" ");
             let text = read_prompt(&args, (!inline.is_empty()).then_some(inline))?
                 .ok_or_else(|| usage("missing prompt text"))?;
-            let mut agent = agent::find(&name)?;
+            let timeout = args.timeout_ms()?;
             let mut client = machine::connect().await?;
-            emit(
-                agent::prompt(
-                    &mut client,
-                    &mut agent,
-                    &text,
-                    args.flag("wait"),
-                    args.timeout_ms()?,
-                )
-                .await?,
-            );
+            emit(match locate(&mut client, &name).await? {
+                Located::Here(mut agent) => {
+                    agent::prompt(&mut client, &mut agent, &text, args.flag("wait"), timeout)
+                        .await?
+                }
+                Located::On(host, _) => {
+                    let mut remote = argv(&["agent", "prompt", &name]);
+                    // A positional prompt also works with herdr-boxd 0.2.0.
+                    remote.push(if text.starts_with('-') {
+                        format!("--prompt={text}")
+                    } else {
+                        text.clone()
+                    });
+                    if args.flag("wait") {
+                        remote.push("--wait".into());
+                    }
+                    if let Some(ms) = timeout {
+                        remote.extend(["--timeout".into(), ms.to_string()]);
+                    }
+                    tree::delegate(&mut client, &host, &remote).await?
+                }
+            });
         }
         "keys" | "send-keys" => {
             let mut args = Args::parse(raw, &[], &[])?;
@@ -849,9 +938,15 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
                     "name at least one key, e.g. enter, esc, down, ctrl+c",
                 ));
             }
-            let agent = agent::find(&name)?;
             let mut client = machine::connect().await?;
-            agent::keys(&mut client, &agent, &keys).await?;
+            match locate(&mut client, &name).await? {
+                Located::Here(agent) => agent::keys(&mut client, &agent, &keys).await?,
+                Located::On(host, _) => {
+                    let mut remote = argv(&["agent", "keys", &name]);
+                    remote.extend(keys.iter().cloned());
+                    tree::delegate(&mut client, &host, &remote).await?;
+                }
+            }
             if ui::json() {
                 ui::print_json(&json!({ "agent": name, "sent": keys }));
             } else {
@@ -860,18 +955,26 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
         }
         "stop" | "rm" => {
             let mut args = Args::parse(raw, &[], &["destroy", "yes"])?;
-            let agent = agent::find(&args.one("agent name")?)?;
+            let name = args.one("agent name")?;
             let mut client = machine::connect().await?;
-            let value =
-                agent::stop(&mut client, &agent, args.flag("destroy"), args.flag("yes")).await?;
+            let (destroy, yes) = (args.flag("destroy"), args.flag("yes"));
+            let value = match locate(&mut client, &name).await? {
+                Located::Here(agent) => agent::stop(&mut client, &agent, destroy, yes).await?,
+                Located::On(host, found) => {
+                    stop_on(&mut client, &host, &found, destroy, yes).await?
+                }
+            };
             if ui::json() {
                 ui::print_json(&value);
             } else {
                 ui::done(format!(
                     "stopped {}{}",
-                    agent.name,
+                    value["agent"].as_str().unwrap_or(&name),
                     if value["machine_destroyed"] == true {
-                        format!(" and destroyed {}", agent.machine)
+                        format!(
+                            " and destroyed {}",
+                            value["machine"].as_str().unwrap_or_default()
+                        )
                     } else {
                         String::new()
                     }
@@ -881,6 +984,81 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
         other => return Err(usage(format!("unknown agent command {other:?}"))),
     }
     Ok(())
+}
+
+/// Where an agent's ledger entry lives.
+enum Located {
+    Here(store::Agent),
+    /// The host whose ledger has it, and its entry from `agent list`.
+    On(String, serde_json::Value),
+}
+
+async fn locate(client: &mut boxd::Client, name: &str) -> Result<Located> {
+    if let Some(agent) = store::agent(&store::dirs(), name) {
+        return Ok(Located::Here(agent));
+    }
+    let tree = tree::list(client).await?;
+    let remote = tree::remote_agents_of(client, &tree).await?;
+    match tree::agent_route(name, false, &remote) {
+        tree::Route::Host(host) => {
+            let found = remote
+                .into_iter()
+                .find(|agent| agent["agent"] == name && agent["host"] == host.as_str())
+                .unwrap_or_default();
+            Ok(Located::On(host, found))
+        }
+        tree::Route::Ambiguous(hosts) => Err(Coded::new(
+            "ambiguous",
+            format!(
+                "agents named {name} are on {}; run the command on one of them",
+                hosts.join(" and ")
+            ),
+        )
+        .into()),
+        _ => Err(tree::missing(
+            "not_found",
+            &format!("an agent named {name}"),
+            &tree,
+        )),
+    }
+}
+
+/// Stops an agent another host manages, there. A cascade is confirmed here,
+/// once, and what `sync` added here for destroyed machines is removed.
+pub async fn stop_on(
+    client: &mut boxd::Client,
+    host: &str,
+    found: &serde_json::Value,
+    destroy: bool,
+    yes: bool,
+) -> Result<serde_json::Value> {
+    let name = found["agent"].as_str().unwrap_or_default();
+    let mut remote = argv(&["agent", "stop", name]);
+    if destroy {
+        remote.push("--destroy".into());
+        let mut confirmed = yes;
+        if !yes && ui::interactive() {
+            let machine = found["machine"].as_str().unwrap_or_default();
+            let tree = tree::list(client).await?;
+            let below = tree::find(&tree, machine)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            if !below.is_empty() {
+                confirm_or_yes(false, &destroy_question(machine, &below))?;
+                confirmed = true;
+            }
+        }
+        if confirmed {
+            remote.push("--yes".into());
+        }
+    }
+    let value = tree::delegate(client, host, &remote).await?;
+    if value["machine_destroyed"] == true {
+        let mut gone = strings(&value["descendants"]);
+        gone.extend(value["machine"].as_str().map(str::to_owned));
+        tree::forget_here(&gone);
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

@@ -338,7 +338,9 @@ async fn agents() -> Result<()> {
         ));
         ui::out("");
         let mut client = machine::connect().await?;
-        let list = agent::visible(&mut client).await?;
+        // The same tree as `agent list`, plus Herdr agents not spawned here.
+        let mut list = agent::visible(&mut client).await?;
+        list.extend(tree::remote_agents(&mut client).await?);
         if list.is_empty() {
             ui::out(ui::dim("  no agents"));
         }
@@ -362,6 +364,22 @@ async fn agents() -> Result<()> {
                     Ok(name) => name,
                     Err(_) => continue,
                 };
+                let entry = list
+                    .iter()
+                    .find(|v| v["agent"] == name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(host) = entry["host"].as_str() {
+                    let machine = entry["machine"].as_str().unwrap_or_default();
+                    let destroy = ui::confirm(
+                        &format!("Also destroy {machine} (only if {name} created it)?"),
+                        false,
+                    )?;
+                    crate::stop_on(&mut client, host, &entry, destroy, false).await?;
+                    ui::done(format!("stopped {name} on {host}"));
+                    ui::pause();
+                    continue;
+                }
                 let found = match agent::find(&name) {
                     Ok(found) => found,
                     Err(_) => {

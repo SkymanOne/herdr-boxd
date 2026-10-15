@@ -532,7 +532,7 @@ pub fn find(name: &str) -> Result<Agent> {
     store::agent(&store::dirs(), name).ok_or_else(|| {
         Coded::new(
             "not_found",
-            format!("no agent named {name}; `herdr-boxd agent list` shows them"),
+            format!("no agent named {name} in this host's herdr-boxd ledger"),
         )
         .into()
     })
@@ -1116,9 +1116,17 @@ pub async fn stop(
         }
         false
     };
-    Ok(
-        json!({ "agent": agent.name, "stopped": true, "machine": agent.machine, "machine_destroyed": destroyed }),
-    )
+    let descendants: Vec<&str> = crate::tree::deepest_first(&below)
+        .into_iter()
+        .map(|node| node.name.as_str())
+        .collect();
+    Ok(json!({
+        "agent": agent.name,
+        "stopped": true,
+        "machine": agent.machine,
+        "machine_destroyed": destroyed,
+        "descendants": descendants,
+    }))
 }
 
 async fn halt(client: &mut boxd::Client, agent: &Agent, profile: &str) -> Result<()> {

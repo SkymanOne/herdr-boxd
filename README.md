@@ -140,6 +140,8 @@ Each machine is recorded by the host that created it. `herdr-boxd list` on your 
 ● └ keen-otter  running     2x8 · 1 agent
 ```
 
+The whole tree is yours to act on from the top. `destroy`, `attach`, and the `agent` commands (`status`, `wait`, `read`, `prompt`, `keys`, `stop`) work on any machine or agent in it. When another machine manages the target, the command runs there over boxd exec, so that machine updates its own ledger and Herdr. Afterwards your computer drops what `sync` had added.
+
 `destroy master` lists every machine below it and asks once (or takes `--yes`). Then it destroys them deepest first, and the master last, so nothing is left billing untracked. If a machine below is asleep, destroy wakes it to look for machines of its own. If one cannot be checked, nothing is destroyed. `list --orphans` is read-only: it shows machines on the account that no ledger in the reachable tree tracks, such as leftovers from a master destroyed with `boxd` directly.
 
 ## Configuration and auth
