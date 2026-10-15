@@ -231,6 +231,7 @@ async fn launch(
                 size: opts.size,
                 snapshot: store::snapshot_name(&store::dirs()),
                 packed: None,
+                attach_herdr: agent.mode != Mode::Headless,
             };
             let ready = machine::provision(client, &plan, created).await?;
             agent.machine = ready.machine;

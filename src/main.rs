@@ -268,24 +268,17 @@ fn config_cmd(raw: Vec<String>) -> Result<()> {
     match args.pos.pop_front().as_deref() {
         Some("show") | None => {
             let snapshot = store::snapshot_name(&dirs);
-            let api_key = store::api_key(&dirs).is_some();
+            let auth = boxd::auth_source()?;
             if ui::json() {
                 ui::print_json(&json!({
                     "snapshot": snapshot,
-                    "auth": if api_key { "api_key" } else { "boxd_login" },
+                    "auth": auth,
                     "config_dir": dirs.config,
                     "state_dir": dirs.state,
                 }));
             } else {
                 ui::out(format!("snapshot  {snapshot}"));
-                ui::out(format!(
-                    "auth      {}",
-                    if api_key {
-                        "API key (stored, mode 600)"
-                    } else {
-                        "boxd login (`boxd auth login`)"
-                    }
-                ));
+                ui::out(format!("auth      {auth}"));
                 ui::out(format!("config    {}", dirs.config.display()));
             }
             Ok(())
@@ -463,6 +456,7 @@ pub async fn start_flow(request: StartRequest) -> Result<()> {
         size,
         snapshot,
         packed,
+        attach_herdr: true,
     };
     let ready = machine::start(&mut client, &plan).await?;
     if ui::json() {

@@ -110,7 +110,7 @@ With `--json`, errors are `{"error":{"code","message"}}` on stderr. The exit cod
 
 ## Configuration and auth
 
-The snapshot name defaults to `herd-base`. Auth uses the token from `boxd auth login`. If that token is rejected, set an API key. The config file is written atomically with mode `600`. The key goes to the token exchange over stdin, so it never appears in `ps`.
+The snapshot name defaults to `herd-base`. Auth is the first of: a stored API key, `BOXD_TOKEN`, `BOXD_API_KEY`, `boxd auth login`, or a token minted automatically inside a boxd VM. The key goes to the token exchange over stdin, so it never appears in `ps`. `config show` reports which source was used.
 
 It only manages machines it created, and it updates the snapshot only when asked.
 

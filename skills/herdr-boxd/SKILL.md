@@ -12,8 +12,9 @@ runs coding agents inside them. Every command takes `--json`; use it always.
 - Errors: `{"error":{"code":"...","message":"..."}}` on stderr, exit 1. Usage errors exit 2.
 - Progress lines go to stderr; ignore them or show them to the user.
 
-Check it is installed with `herdr-boxd --version`. It needs a `boxd auth login`
-(or `herdr-boxd config set api-key`). The plugin and pane mode need Herdr 0.9.1 or newer on this
+Check it is installed with `herdr-boxd --version`. Auth is a stored API key,
+`BOXD_TOKEN`, `BOXD_API_KEY`, `boxd auth login`, or automatic inside a boxd VM.
+The plugin and pane mode need Herdr 0.9.1 or newer on this
 computer; headless mode works without Herdr, from any shell or CI.
 
 ## Two modes
@@ -129,7 +130,7 @@ CLI directly.
 
 ## Error codes worth handling
 
-`usage`, `auth` (ask the user to run `boxd auth login`), `quota`,
+`usage`, `auth` (API key, `BOXD_TOKEN`, `BOXD_API_KEY`, `boxd auth login`, or a boxd VM), `quota`,
 `already_exists`, `not_found`, `not_owned`, `snapshot_not_found`, `busy`,
 `timeout`, `agent_not_ready`, `unavailable` and `unreachable` (retry),
 `ssh_unreachable`, `machine_gone`, `herdr_missing` (use `--headless`), `herdr_old` (install Herdr 0.9.1 or newer), `workdir_in_use` (another agent works in

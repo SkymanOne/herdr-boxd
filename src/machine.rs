@@ -83,10 +83,7 @@ pub fn check_machine_name(name: &str) -> Result<()> {
 }
 
 pub async fn connect() -> Result<boxd::Client> {
-    let dirs = store::dirs();
-    let key = store::api_key(&dirs);
-    let token = boxd::load_token(key.as_deref())?;
-    boxd::Client::connect(&token).await
+    boxd::Client::connect().await
 }
 
 pub struct Plan {
@@ -94,6 +91,8 @@ pub struct Plan {
     pub size: Size,
     pub snapshot: String,
     pub packed: Option<Packed>,
+    /// Headless agents use the boxd API only.
+    pub attach_herdr: bool,
 }
 
 #[derive(Serialize)]
@@ -170,7 +169,7 @@ pub async fn provision(
     created: &mut Option<Created>,
 ) -> Result<Ready> {
     // Everything that can fail cheaply runs before the machine exists.
-    let herdr = herdr::available();
+    let herdr = plan.attach_herdr && herdr::available();
     if herdr {
         ssh::identity_file()?;
     }
