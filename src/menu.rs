@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::machine::{self, Listed, Size, SIZES};
 use crate::ui::{self, Key};
-use crate::{agent, store, Coded, CopyChoice, StartRequest};
+use crate::{agent, store, tree, Coded, CopyChoice, StartRequest};
 
 pub async fn run(screen: Option<&str>) -> Result<()> {
     let screen = screen
@@ -78,6 +78,13 @@ async fn home() -> Result<()> {
             Key::Char('3') => update().await,
             Key::Char('4') => destroy().await,
             Key::Char('5') => agents().await,
+            Key::Char('r') => {
+                ui::step("syncing Herdr machines");
+                if let Ok(mut client) = machine::connect().await {
+                    tree::sync_best_effort(&mut client).await;
+                }
+                continue;
+            }
             Key::Char('q') | Key::Cancel => return Ok(()),
             _ => continue,
         };
@@ -100,15 +107,39 @@ fn header() {
 
 async fn fetch_machines() -> Result<Vec<Listed>> {
     let mut client = machine::connect().await?;
-    machine::list(&mut client).await
+    tree::list(&mut client).await
 }
 
+/// Every machine with its depth, parents before children.
+fn rows(machines: &[Listed], depth: usize, out: &mut Vec<(usize, Listed)>) {
+    for m in machines {
+        out.push((depth, m.clone()));
+        rows(&m.children, depth + 1, out);
+    }
+}
+
+/// One line per machine; the machines each one created are indented below it.
 pub fn machine_lines(machines: &[Listed]) -> Vec<String> {
     let herdr = crate::herdr::available();
-    let width = machines.iter().map(|m| m.name.len()).max().unwrap_or(0);
-    machines
+    let profiles = if herdr {
+        crate::herdr::profiles().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let in_herdr_here = |name: &str| profiles.iter().any(|p| p.is_for(name));
+    let mut all = Vec::new();
+    rows(machines, 0, &mut all);
+    let label = |depth: usize, name: &str| match depth {
+        0 => name.to_owned(),
+        _ => format!("{}└ {name}", "  ".repeat(depth - 1)),
+    };
+    let width = all
         .iter()
-        .map(|m| {
+        .map(|(depth, m)| label(*depth, &m.name).chars().count())
+        .max()
+        .unwrap_or(0);
+    all.iter()
+        .map(|(depth, m)| {
             let dot = match m.status.as_str() {
                 "running" => ui::paint("32", "●"),
                 "gone" => ui::paint("31", "●"),
@@ -125,14 +156,21 @@ pub fn machine_lines(machines: &[Listed]) -> Vec<String> {
                     if m.agents == 1 { "" } else { "s" }
                 ));
             }
+            if let Some(reason) = &m.unreachable {
+                extra.push(format!("its machines are unknown: {reason}"));
+            }
             if m.status == "gone" {
                 extra.push("destroyed outside the plugin; destroy to clean up".into());
-            } else if herdr && !m.in_herdr {
+            } else if *depth == 0 && herdr && !m.in_herdr {
                 extra.push("not in Herdr; `herdr-boxd attach` fixes it".into());
+            } else if *depth > 0 && herdr && m.status == "running" && !in_herdr_here(&m.name) {
+                extra.push("not in Herdr here; `herdr-boxd sync` adds it".into());
             }
+            let name = label(*depth, &m.name);
+            let pad = width.saturating_sub(name.chars().count());
             format!(
-                "{dot} {:width$}  {:11} {}",
-                m.name,
+                "{dot} {name}{}  {:11} {}",
+                " ".repeat(pad),
                 m.status,
                 ui::dim(extra.join(" · "))
             )
@@ -208,20 +246,40 @@ fn configure() -> Result<()> {
     Ok(())
 }
 
-/// Number keys pick from up to nine machines; Esc cancels.
-fn pick(names: &[String], verb: &str) -> Result<String> {
+/// What a picker lists, for its wording.
+#[derive(Clone, Copy)]
+enum Noun {
+    Machine,
+    Agent,
+}
+
+impl Noun {
+    fn question(self, verb: &str) -> String {
+        match self {
+            Noun::Machine => format!("Which machine to {verb}?"),
+            Noun::Agent => format!("Which agent to {verb}?"),
+        }
+    }
+
+    fn none(self, verb: &str) -> String {
+        match self {
+            Noun::Machine => format!("no plugin machines to {verb}"),
+            Noun::Agent => format!("no agents to {verb}"),
+        }
+    }
+}
+
+/// Number keys pick from up to nine names; Esc cancels.
+fn pick(names: &[String], noun: Noun, verb: &str) -> Result<String> {
     match names {
-        [] => bail!(Coded::new(
-            "not_found",
-            format!("no plugin machines to {verb}")
-        )),
+        [] => bail!(Coded::new("not_found", noun.none(verb))),
         [only] => return Ok(only.clone()),
         _ => {}
     }
     for (i, name) in names.iter().enumerate().take(9) {
         ui::out(format!("  {}  {name}", ui::bold(i + 1)));
     }
-    eprint!("{} ", ui::bold(format!("Which machine to {verb}?")));
+    eprint!("{} ", ui::bold(noun.question(verb)));
     loop {
         match ui::read_key()? {
             Key::Cancel => bail!(Coded::new("cancelled", "cancelled")),
@@ -248,7 +306,7 @@ async fn update() -> Result<()> {
         "This replaces {snapshot}; every new session starts from it."
     )));
     ui::out("");
-    let name = pick(&store::machines(&dirs), "save")?;
+    let name = pick(&store::machines(&dirs), Noun::Machine, "save")?;
     if !ui::confirm(&format!("Overwrite {snapshot} with {name}?"), false)? {
         bail!(Coded::new("cancelled", "cancelled"));
     }
@@ -264,7 +322,7 @@ async fn destroy() -> Result<()> {
     ui::out(ui::bold("Destroy a machine"));
     ui::out(ui::dim("Only machines this plugin created are listed."));
     ui::out("");
-    let name = pick(&store::machines(&dirs), "destroy")?;
+    let name = pick(&store::machines(&dirs), Noun::Machine, "destroy")?;
     let agents = store::agents(&dirs)
         .iter()
         .filter(|a| a.machine == name)
@@ -274,14 +332,15 @@ async fn destroy() -> Result<()> {
     } else {
         String::new()
     };
+    let mut client = machine::connect().await?;
+    let below = tree::descendants(&mut client, &name).await?;
     if !ui::confirm(
-        &format!("Destroy {name}? The machine and its disk are deleted.{warning}"),
+        &format!("{}{warning}", crate::destroy_question(&name, &below)),
         false,
     )? {
         bail!(Coded::new("cancelled", "cancelled"));
     }
-    let mut client = machine::connect().await?;
-    let existed = machine::destroy(&mut client, &name).await?;
+    let existed = machine::destroy_tree(&mut client, &name, &below).await?;
     ui::done(if existed {
         format!("destroyed {name}")
     } else {
@@ -299,7 +358,9 @@ async fn agents() -> Result<()> {
         ));
         ui::out("");
         let mut client = machine::connect().await?;
-        let list = agent::visible(&mut client).await?;
+        // The same tree as `agent list`, plus Herdr agents not spawned here.
+        let mut list = agent::visible(&mut client).await?;
+        list.extend(tree::remote_agents(&mut client).await?);
         if list.is_empty() {
             ui::out(ui::dim("  no agents"));
         }
@@ -319,10 +380,26 @@ async fn agents() -> Result<()> {
                     .iter()
                     .filter_map(|v| v["agent"].as_str().map(str::to_owned))
                     .collect();
-                let name = match pick(&names, "stop") {
+                let name = match pick(&names, Noun::Agent, "stop") {
                     Ok(name) => name,
                     Err(_) => continue,
                 };
+                let entry = list
+                    .iter()
+                    .find(|v| v["agent"] == name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(host) = entry["host"].as_str() {
+                    let machine = entry["machine"].as_str().unwrap_or_default();
+                    let destroy = ui::confirm(
+                        &format!("Also destroy {machine} (only if {name} created it)?"),
+                        false,
+                    )?;
+                    crate::stop_on(&mut client, host, &entry, destroy, false).await?;
+                    ui::done(format!("stopped {name} on {host}"));
+                    ui::pause();
+                    continue;
+                }
                 let found = match agent::find(&name) {
                     Ok(found) => found,
                     Err(_) => {
@@ -333,7 +410,7 @@ async fn agents() -> Result<()> {
                 };
                 let destroy = found.owns_machine
                     && ui::confirm(&format!("Also destroy {}?", found.machine), false)?;
-                agent::stop(&mut client, &found, destroy).await?;
+                agent::stop(&mut client, &found, destroy, false).await?;
                 ui::done(format!("stopped {name}"));
                 ui::pause();
             }
@@ -351,12 +428,16 @@ fn agent_line(value: &Value) -> String {
         "blocked" => "33",
         _ => "31",
     };
+    let via = value["host"]
+        .as_str()
+        .map(|host| format!(" · via {host}"))
+        .unwrap_or_default();
     format!(
         "{:16} {} {}",
         value["agent"].as_str().unwrap_or("?"),
         ui::paint(color, format!("{status:10}")),
         ui::dim(format!(
-            "{} {} on {} · {}",
+            "{} {} on {} · {}{via}",
             value["mode"].as_str().unwrap_or(""),
             value["kind"].as_str().unwrap_or(""),
             value["machine"].as_str().unwrap_or(""),
@@ -369,5 +450,29 @@ pub fn print_agent(value: &Value) {
     ui::out(agent_line(value));
     if let Some(detail) = value.get("detail") {
         ui::out(format!("  {}", ui::dim(detail)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pickers_name_what_they_list() {
+        assert_eq!(Noun::Agent.question("stop"), "Which agent to stop?");
+        assert_eq!(
+            Noun::Machine.question("destroy"),
+            "Which machine to destroy?"
+        );
+        assert_eq!(Noun::Agent.none("stop"), "no agents to stop");
+        assert_eq!(Noun::Machine.none("save"), "no plugin machines to save");
+    }
+
+    #[test]
+    fn pick_reports_an_empty_list_in_its_own_words() {
+        let err = pick(&[], Noun::Agent, "stop").unwrap_err();
+        assert_eq!(err.to_string(), "no agents to stop");
+        let only = pick(&["a".to_owned()], Noun::Agent, "stop").unwrap();
+        assert_eq!(only, "a");
     }
 }

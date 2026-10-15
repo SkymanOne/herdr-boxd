@@ -84,7 +84,7 @@ dialog: `agent read` it, then answer with `agent keys`, or ask the user.
 ## Monitor
 
 ```bash
-herdr-boxd --json agent list                    # every agent, with live status
+herdr-boxd --json agent list                    # every agent, with live status (also those of machines you created)
 herdr-boxd --json agent status fix-auth
 herdr-boxd --json agent wait fix-auth --timeout 600000   # until idle/done/blocked (pane) or finished (headless)
 herdr-boxd --json agent read fix-auth --lines 200        # screen text (pane) or log + "result" (headless)
@@ -110,7 +110,7 @@ herdr-boxd --json agent keys fix-auth ctrl+c          # pane only: interrupt
 
 ```bash
 herdr-boxd --json agent stop fix-auth             # stop the agent, keep the machine
-herdr-boxd --json agent stop fix-auth --destroy   # also destroy the machine it created
+herdr-boxd --json agent stop fix-auth --destroy --yes  # also destroy the machine it created, and its machines
 ```
 
 Get results out before destroying: have the agent `git push`, or `agent read`
@@ -120,19 +120,32 @@ agent did not create. Machines left running cost money; clean up when done.
 ## Machines
 
 ```bash
-herdr-boxd --json list                 # plugin machines: status, size, agents
+herdr-boxd --json list                 # plugin machines as a tree: status, size, agents, children
+herdr-boxd --json list --orphans       # account machines no reachable ledger tracks (read-only)
 herdr-boxd --json attach M             # wake + reconnect to Herdr
-herdr-boxd --json destroy M --yes
+herdr-boxd --json sync                 # add every running machine in the tree to Herdr here
+herdr-boxd --json destroy M --yes      # destroys M's own machines first, deepest first
 ```
 
 The plugin only manages machines it created. For anything else use the `boxd`
 CLI directly.
+
+A machine can run herdr-boxd itself (a "master"), so machines form a tree.
+`list` nests each machine's own machines under `children`, three levels deep.
+It never wakes a sleeping machine. A running machine whose machines could not
+be read has `unreachable` set. In `agent list`, an agent that another
+machine manages has `host` set. Use the usual commands on it anyway. `agent
+status/wait/read/prompt/keys/stop`, `attach` and `destroy` run on the managing
+host for you, with the same JSON and exit codes. Two agents with one name on
+different hosts give `ambiguous`.
+Inside a boxd VM, SSH to the machines it creates needs no setup; the plugin
+handles the key.
 
 ## Error codes worth handling
 
 `usage`, `auth` (API key, `BOXD_TOKEN`, `BOXD_API_KEY`, `boxd auth login`, or a boxd VM), `quota`,
 `already_exists`, `not_found`, `not_owned`, `snapshot_not_found`, `busy`,
 `timeout`, `agent_not_ready`, `unavailable` and `unreachable` (retry),
-`ssh_unreachable`, `machine_gone`, `herdr_missing` (use `--headless`), `herdr_old` (install Herdr 0.9.1 or newer), `workdir_in_use` (another agent works in
+`ssh_unreachable`, `machine_gone`, `ambiguous`, `herdr_missing` (use `--headless`), `herdr_old` (install Herdr 0.9.1 or newer), `workdir_in_use` (another agent works in
 that directory; share it with `--workdir` instead of copying over it),
 `cancelled`.

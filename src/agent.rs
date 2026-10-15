@@ -171,6 +171,9 @@ pub async fn spawn(opts: SpawnOpts) -> Result<Value> {
             agent.machine
         )
     })?;
+    if agent.owns_machine && agent.mode == Mode::Pane {
+        crate::tree::sync_best_effort(&mut client).await;
+    }
     Ok(view(&agent, &status))
 }
 
@@ -529,7 +532,7 @@ pub fn find(name: &str) -> Result<Agent> {
     store::agent(&store::dirs(), name).ok_or_else(|| {
         Coded::new(
             "not_found",
-            format!("no agent named {name}; `herdr-boxd agent list` shows them"),
+            format!("no agent named {name} in this host's herdr-boxd ledger"),
         )
         .into()
     })
@@ -580,7 +583,7 @@ pub async fn visible(client: &mut boxd::Client) -> Result<Vec<Value>> {
             push_live(&mut listed, &mut seen, &name, &live);
         }
     }
-    if let Some(here) = current_boxd_name() {
+    if let Some(here) = store::host_name() {
         if !queried.contains(&here) {
             if let Ok(live) = herdr_agents(None).await {
                 push_live(&mut listed, &mut seen, &here, &live);
@@ -588,17 +591,6 @@ pub async fn visible(client: &mut boxd::Client) -> Result<Vec<Value>> {
         }
     }
     Ok(listed)
-}
-
-fn current_boxd_name() -> Option<String> {
-    std::env::var("boxd_vm_name")
-        .ok()
-        .filter(|name| !name.is_empty())
-        .or_else(|| {
-            std::env::var("BOXD_VM_NAME")
-                .ok()
-                .filter(|name| !name.is_empty())
-        })
 }
 
 fn push_live(
@@ -1074,12 +1066,26 @@ pub async fn keys(client: &mut boxd::Client, agent: &Agent, keys: &[String]) -> 
 
 /// Stops the agent and forgets it. With `destroy`, also destroys the machine
 /// if this agent created it and no other agent still uses it.
-pub async fn stop(client: &mut boxd::Client, agent: &Agent, destroy: bool) -> Result<Value> {
+pub async fn stop(
+    client: &mut boxd::Client,
+    agent: &Agent,
+    destroy: bool,
+    yes: bool,
+) -> Result<Value> {
     let dirs = store::dirs();
     let others = store::agents(&dirs)
         .iter()
         .any(|other| other.machine == agent.machine && other.name != agent.name);
     let destroying = destroy && agent.owns_machine && !others;
+    // Machines the agent's machine created go with it; ask once about them.
+    let below = if destroying {
+        crate::tree::descendants(client, &agent.machine).await?
+    } else {
+        Vec::new()
+    };
+    if !below.is_empty() {
+        crate::confirm_or_yes(yes, &crate::destroy_question(&agent.machine, &below))?;
+    }
     // A sleeping machine resumes the agent when it wakes, so wake it and stop
     // it now rather than forget an agent that would come back unwatched.
     // Destroying the machine stops it anyway.
@@ -1094,7 +1100,7 @@ pub async fn stop(client: &mut boxd::Client, agent: &Agent, destroy: bool) -> Re
     }
     store::forget_agent(&dirs, &agent.name)?;
     let destroyed = if destroying {
-        machine::destroy(client, &agent.machine).await?;
+        machine::destroy_tree(client, &agent.machine, &below).await?;
         true
     } else {
         if destroy {
@@ -1110,9 +1116,17 @@ pub async fn stop(client: &mut boxd::Client, agent: &Agent, destroy: bool) -> Re
         }
         false
     };
-    Ok(
-        json!({ "agent": agent.name, "stopped": true, "machine": agent.machine, "machine_destroyed": destroyed }),
-    )
+    let descendants: Vec<&str> = crate::tree::deepest_first(&below)
+        .into_iter()
+        .map(|node| node.name.as_str())
+        .collect();
+    Ok(json!({
+        "agent": agent.name,
+        "stopped": true,
+        "machine": agent.machine,
+        "machine_destroyed": destroyed,
+        "descendants": descendants,
+    }))
 }
 
 async fn halt(client: &mut boxd::Client, agent: &Agent, profile: &str) -> Result<()> {

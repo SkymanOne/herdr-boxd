@@ -6,11 +6,11 @@ It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. 
 
 ## Install
 
-Plugin. Pin a release with `--ref v0.2.0`. If this directory was linked, unlink it first:
+Plugin. Pin a release with `--ref v0.3.0`. If this directory was linked, unlink it first:
 
 ```bash
 herdr plugin unlink boxd.session
-herdr plugin install SkymanOne/herdr-boxd --ref v0.2.0
+herdr plugin install SkymanOne/herdr-boxd --ref v0.3.0
 ```
 
 CLI only, on Apple Silicon or Linux x86_64, including a boxd VM:
@@ -57,12 +57,12 @@ The menu lists your plugin machines with their live status. Press a key; no Ente
 | 3 | Save a plugin machine back to that snapshot |
 | 4 | Destroy a machine this plugin created |
 | 5 | Agents: live status, and stop |
-| r | Refresh |
+| r | Refresh, and sync the tree into Herdr |
 | q | Close the menu |
 
 Start asks for a name (blank lets boxd pick one), a size (Enter gives 2 vCPU / 8 GB), and whether to copy the focused pane's project. Then it shows a summary. Nothing is created until you confirm.
 
-- **Copy** is git-aware. In a repo it sends tracked files, plus untracked files that aren't ignored, plus `.git`. Outside a repo it skips `target`, `node_modules`, `.venv`, and similar directories. It asks first if the upload is over 500 MB. It never copies `/` or your home directory. The shell opens in that directory, not `/home/boxd`.
+- **Copy** is git-aware. In a repo it sends tracked files, plus untracked files that aren't ignored, plus `.git`. Outside a repo it skips `target`, `node_modules`, `.venv`, and similar directories. It asks first if the upload is over 500 MB. It never copies `/` or your home directory. The shell opens in that directory, not `/home/boxd`. The snapshot's own `~` workspace is closed if nobody has touched it: one idle shell in `/home/boxd`, no agent.
 - **Size.** A snapshot restore keeps the snapshot's size. Any other size costs one quick reboot.
 - **Hostname.** If the size already matches, there is no reboot. The plugin restarts the machine's Herdr server instead, so shells that were restored from the snapshot pick up the new hostname.
 - **If anything fails, or you close the popup or press Ctrl-C** after the machine exists, the plugin destroys it again. You never pay for a half-set-up machine.
@@ -73,10 +73,12 @@ When it finishes, the machine is in the Herdr sidebar.
 
 ```bash
 herdr-boxd start --name my-box --size 2x8 --cwd "$PWD" --copy
-herdr-boxd list                      # status, size, agents; flags machines deleted elsewhere
+herdr-boxd list                      # a tree: status, size, agents; flags machines deleted elsewhere
+herdr-boxd list --orphans            # account machines that no reachable ledger tracks
 herdr-boxd attach my-box             # wake a sleeping machine and reconnect it to Herdr
+herdr-boxd sync                      # every running machine in the tree into Herdr here
 herdr-boxd update my-box --yes       # overwrite the snapshot with this machine
-herdr-boxd destroy my-box --yes
+herdr-boxd destroy my-box --yes      # and the machines it created
 herdr-boxd config show
 herdr-boxd config set snapshot herd-base
 herdr-boxd config set api-key        # prompts without echo, or reads stdin
@@ -112,13 +114,43 @@ herdr-boxd --json agent stop fix-auth --destroy
 
 With `--json`, errors are `{"error":{"code","message"}}` on stderr. The exit code is 1 for errors and 2 for usage errors.
 
+## Remote master
+
+A master is a boxd VM that runs Herdr and an orchestrating agent, and creates machines with herdr-boxd. You can leave it running and connect to it from anywhere.
+
+Set one up from your computer. The plugin goes in for the menu, and `install.sh` puts the CLI on the agent's `PATH`:
+
+```bash
+herdr-boxd start --name master --size 4x16      # or any boxd VM with Herdr
+ssh -t master.boxd 'herdr plugin install SkymanOne/herdr-boxd --ref v0.3.0'
+boxd machine exec master -- sh -c 'curl -fsSL https://raw.githubusercontent.com/SkymanOne/herdr-boxd/main/install.sh | sh'
+```
+
+Inside the master, auth is automatic. There is no boxd daemon and no SSH key there, so the first `start`, `attach`, or pane spawn creates `~/.ssh/herdr-boxd_ed25519`. Over the boxd exec stream it puts that key on the child, starts a key-only sshd there, and pins the child's host key. `ssh <child>.boxd` then works over the private network, so you never link a key by hand.
+
+There are two ways to connect:
+
+- **From Herdr on your Mac.** The master is in your sidebar if you started it with herdr-boxd. Run `herdr-boxd sync`, or press `r` in the menu, and the master's machines join your sidebar too.
+- **Over SSH.** `ssh -t master.boxd herdr` opens the master's own Herdr, with its machines in its sidebar.
+
+Each machine is recorded by the host that created it. `herdr-boxd list` on your computer shows the whole tree, three levels deep:
+
+```
+● master        running     4x16
+● └ keen-otter  running     2x8 · 1 agent
+```
+
+The whole tree is yours to act on from the top. `destroy`, `attach`, and the `agent` commands (`status`, `wait`, `read`, `prompt`, `keys`, `stop`) work on any machine or agent in it. When another machine manages the target, the command runs there over boxd exec, so that machine updates its own ledger and Herdr. Afterwards your computer drops what `sync` had added.
+
+`destroy master` lists every machine below it and asks once (or takes `--yes`). Then it destroys them deepest first, and the master last, so nothing is left billing untracked. If a machine below is asleep, destroy wakes it to look for machines of its own. If one cannot be checked, nothing is destroyed. `list --orphans` is read-only: it shows machines on the account that no ledger in the reachable tree tracks, such as leftovers from a master destroyed with `boxd` directly.
+
 ## Configuration and auth
 
 The snapshot name defaults to `herd-base`. Auth is the first of: a stored API key, `BOXD_TOKEN`, `BOXD_API_KEY`, `boxd auth login`, or a token minted automatically inside a boxd VM. The key goes to the token exchange over stdin, so it never appears in `ps`. `config show` reports which source was used.
 
 It only manages machines it created, and it updates the snapshot only when asked.
 
-SSH: boxd's own daemon keeps `Host <name>.boxd` entries in `~/.ssh/config`. The plugin writes a fallback block only if the daemon hasn't written one. It writes atomically, preserves the file mode, and follows a symlinked config. Destroy removes the block again.
+SSH: boxd's own daemon keeps `Host <name>.boxd` entries in `~/.ssh/config`. The plugin writes a fallback block only if the daemon hasn't written one, or inside a boxd VM, where there is no daemon (see [Remote master](#remote-master)). It writes atomically, preserves the file mode, and follows a symlinked config. Destroy removes the block again.
 
 ## License
 

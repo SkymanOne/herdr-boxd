@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::boxd::{self, proto::GetVmResponse};
 use crate::copy::{self, Packed};
@@ -103,6 +103,10 @@ pub struct Ready {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub workdir: String,
+    /// Workspaces restored from the snapshot, seen right after
+    /// `herdr machine add`; closed later only if still untouched.
+    #[serde(skip)]
+    pub home_workspaces: Vec<String>,
 }
 
 /// A machine that exists but is not fully set up yet; `rollback` removes it.
@@ -148,7 +152,7 @@ pub async fn start(client: &mut boxd::Client, plan: &Plan) -> Result<Ready> {
     if plan.packed.is_some() {
         if let Some(profile) = &ready.profile {
             tokio::select! {
-                () = open_project_shell(profile, &ready.workdir) => {}
+                () = open_project_shell(profile, &ready.workdir, &ready.home_workspaces) => {}
                 () = interrupted() => {
                     ui::warn(format!(
                         "interrupted while opening a shell in {}; {} is ready",
@@ -171,7 +175,7 @@ pub async fn provision(
     // Everything that can fail cheaply runs before the machine exists.
     let herdr = plan.attach_herdr && herdr::available();
     if herdr {
-        ssh::identity_file()?;
+        ensure_identity()?;
     }
     client.check_snapshot(&plan.snapshot).await?;
     let name = match &plan.name {
@@ -221,6 +225,11 @@ pub async fn provision(
         None
     };
 
+    // Before the user can touch them: only these may be tidied away later.
+    let home_workspaces = match (&profile, &plan.packed) {
+        (Some(profile), Some(_)) => workspace_ids(profile).await,
+        _ => Vec::new(),
+    };
     let workdir = match &plan.packed {
         Some(packed) => copy::push(client, &name, packed).await?,
         None => "/home/boxd".to_owned(),
@@ -231,10 +240,40 @@ pub async fn provision(
         size: size_label(vm.vcpu, vm.memory_bytes),
         profile,
         workdir,
+        home_workspaces,
     })
 }
 
+/// The SSH key to use. Outside a VM that is boxd's own key; inside one, the
+/// plugin's key, made once. Returns the public key line inside a VM.
+pub fn ensure_identity() -> Result<Option<String>> {
+    if !boxd::in_vm() {
+        ssh::identity_file()?;
+        return Ok(None);
+    }
+    let host = store::host_name().unwrap_or_else(|| "boxd-vm".into());
+    let pubkey = ssh::generate_key(&ssh::vm_key()?, &format!("herdr-boxd@{host}"))?;
+    Ok(Some(pubkey))
+}
+
+/// Run in the machine over exec: trust our key, start a key-only sshd (boxd
+/// machines ship it masked), and print the host key to pin.
+const SSHD_SETUP: &str = r#"set -e
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+grep -qxF "$KEY" ~/.ssh/authorized_keys || printf '%s\n' "$KEY" >> ~/.ssh/authorized_keys
+if ! systemctl is-active --quiet ssh.service; then
+  printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n' |
+    sudo tee /etc/ssh/sshd_config.d/herdr-boxd.conf >/dev/null
+  sudo systemctl unmask ssh.service >/dev/null 2>&1 || true
+  sudo systemctl enable --now ssh.service >/dev/null 2>&1
+fi
+cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub"#;
+
 async fn connect_ssh(client: &mut boxd::Client, name: &str, vm: &GetVmResponse) -> Result<()> {
+    if let Some(pubkey) = ensure_identity()? {
+        return connect_private(client, name, &pubkey).await;
+    }
     let domain = if vm.access_domain.is_empty() {
         "boxd.sh"
     } else {
@@ -253,6 +292,30 @@ async fn connect_ssh(client: &mut boxd::Client, name: &str, vm: &GetVmResponse) 
     if ssh::ensure_alias(name, &host, vm.ssh_port, &host_key)? {
         ssh::warn_fallback(name);
     }
+    ssh::wait_ready(name, Duration::from_secs(120)).await
+}
+
+/// Inside a VM, boxd's SSH gateway is closed to us: it only takes keys linked
+/// by an interactive login, which a VM token cannot do. So the machine gets
+/// our key and an sshd over the authenticated exec stream, and we reach it on
+/// the private network, where `<name>.boxd` resolves to its address. The host
+/// key is pinned from that same exec, before the first connection.
+async fn connect_private(client: &mut boxd::Client, name: &str, pubkey: &str) -> Result<()> {
+    let script = format!("KEY={}\n{SSHD_SETUP}", crate::agent::sh_quote(pubkey));
+    // Right after a boot (a resize reboots) systemd may not answer yet.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let host_key = loop {
+        match client.exec(name, &script).await?.check("setting up SSH") {
+            Ok(output) => break output.stdout_text(),
+            Err(err) if tokio::time::Instant::now() >= deadline => return Err(err),
+            Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    };
+    let host_key = host_key.trim();
+    if !host_key.starts_with("ssh-") {
+        bail!("{name} printed no SSH host key");
+    }
+    ssh::ensure_alias(name, &ssh::alias(name), 22, host_key)?;
     ssh::wait_ready(name, Duration::from_secs(120)).await
 }
 
@@ -301,7 +364,9 @@ pub fn require_owned(name: &str) -> Result<()> {
     }
     bail!(Coded::new(
         "not_owned",
-        format!("{name} was not created by herdr-boxd; it only manages its own machines"),
+        format!(
+            "{name} is not in this host's herdr-boxd ledger; `herdr-boxd list` shows which machine manages it"
+        ),
     ));
 }
 
@@ -319,14 +384,46 @@ pub async fn destroy(client: &mut boxd::Client, name: &str) -> Result<bool> {
     Ok(existed)
 }
 
-#[derive(Serialize, Clone)]
+/// Destroys what `name` created (`below`, from `tree::descendants`) deepest
+/// first, then `name`. A failure stops before `name`, so a retry finds the
+/// rest still tracked.
+pub async fn destroy_tree(client: &mut boxd::Client, name: &str, below: &[Listed]) -> Result<bool> {
+    for node in crate::tree::deepest_first(below) {
+        ui::step(format!(
+            "destroying {} (created by {})",
+            node.name, node.parent
+        ));
+        client.destroy(&node.name).await?;
+        // `sync` may have added it here too.
+        if let Err(err) = herdr::remove_profile(&node.name) {
+            ui::warn(format!("could not remove the Herdr profile: {err:#}"));
+        }
+        let _ = ssh::remove(&node.name);
+    }
+    destroy(client, name).await
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Listed {
     pub name: String,
     /// boxd status, or "gone" when the machine no longer exists.
     pub status: String,
     pub size: Option<String>,
+    /// Whether the host that tracks this machine has it in Herdr.
     pub in_herdr: bool,
     pub agents: usize,
+    /// The host that created it; empty at the root.
+    #[serde(default)]
+    pub parent: String,
+    /// Machines this one created, found by running herdr-boxd inside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Listed>,
+    /// Why its own machines could not be listed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<String>,
+    /// herdr-boxd answered inside it, so it can host agents of its own.
+    #[serde(skip)]
+    pub manages: bool,
 }
 
 pub async fn list(client: &mut boxd::Client) -> Result<Vec<Listed>> {
@@ -340,39 +437,135 @@ pub async fn list(client: &mut boxd::Client) -> Result<Vec<Listed>> {
         .collect();
     let profiles = herdr::profiles().unwrap_or_default();
     let agents = store::agents(&dirs);
-    Ok(store::machines(&dirs)
+    let here = store::host_name().unwrap_or_default();
+    Ok(store::entries(&dirs)
         .into_iter()
-        .map(|name| {
+        .map(|entry| {
+            let name = entry.name;
             let vm = vms.get(&name);
             Listed {
                 status: vm.map_or("gone".into(), |vm| vm.status.clone()),
                 size: vm.map(|vm| size_label(vm.vcpu, vm.memory_bytes)),
                 in_herdr: profiles.iter().any(|p| p.is_for(&name)),
                 agents: agents.iter().filter(|a| a.machine == name).count(),
+                parent: if entry.parent.is_empty() {
+                    here.clone()
+                } else {
+                    entry.parent
+                },
+                children: Vec::new(),
+                unreachable: None,
+                manages: false,
                 name,
             }
         })
         .collect())
 }
 
-pub async fn open_project_shell(profile: &str, workdir: &str) {
+/// Opens the project's workspace, then closes the snapshot's leftover home
+/// workspaces that nobody has used.
+pub async fn open_project_shell(profile: &str, workdir: &str, home_workspaces: &[String]) {
     if profile.is_empty() {
         return;
     }
-    if let Err(err) = focus_project_shell(profile, workdir).await {
-        ui::warn(format!("could not open a shell in {workdir}: {err:#}"));
+    match focus_project_shell(profile, workdir).await {
+        Ok(project) => {
+            for id in home_workspaces.iter().filter(|id| **id != project) {
+                close_if_untouched(profile, id).await;
+            }
+        }
+        Err(err) => ui::warn(format!("could not open a shell in {workdir}: {err:#}")),
     }
 }
 
-async fn focus_project_shell(profile: &str, workdir: &str) -> Result<()> {
+async fn focus_project_shell(profile: &str, workdir: &str) -> Result<String> {
     ui::step(format!("opening a shell in {workdir}"));
     herdr::wait_reachable(profile, Duration::from_secs(60)).await?;
     let label = workdir
         .rsplit('/')
         .find(|part| !part.is_empty())
         .unwrap_or(workdir);
-    herdr::create_workspace(profile, workdir, label, true).await?;
-    Ok(())
+    let (workspace, _) = herdr::create_workspace(profile, workdir, label, true).await?;
+    Ok(workspace)
+}
+
+/// Workspace ids on the machine now; empty if Herdr does not answer.
+async fn workspace_ids(profile: &str) -> Vec<String> {
+    let Ok(reply) =
+        herdr::remote_timeout(profile, &["workspace", "list"], Duration::from_secs(20)).await
+    else {
+        return Vec::new();
+    };
+    reply["result"]["workspaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["workspace_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Closes `workspace` only if it is still exactly what the snapshot restored:
+/// one tab, one pane in /home/boxd, no agent, and the shell idle. Any doubt or
+/// error leaves it open.
+async fn close_if_untouched(profile: &str, workspace: &str) {
+    let limit = Duration::from_secs(20);
+    let Ok(info) = herdr::remote_timeout(profile, &["workspace", "get", workspace], limit).await
+    else {
+        return;
+    };
+    let Ok(panes) =
+        herdr::remote_timeout(profile, &["pane", "list", "--workspace", workspace], limit).await
+    else {
+        return;
+    };
+    let Some(pane) = sole_home_pane(&info["result"]["workspace"], &panes["result"]["panes"]) else {
+        return;
+    };
+    let Ok(process) =
+        herdr::remote_timeout(profile, &["pane", "process-info", "--pane", &pane], limit).await
+    else {
+        return;
+    };
+    if !shell_idle(&process["result"]["process_info"]) {
+        return;
+    }
+    if herdr::remote_timeout(profile, &["workspace", "close", workspace], limit)
+        .await
+        .is_ok()
+    {
+        ui::step(format!("closed the unused home workspace {workspace}"));
+    }
+}
+
+const HOME: &str = "/home/boxd";
+
+/// The pane id when the workspace has one tab and one pane, in the home
+/// directory, with no agent.
+fn sole_home_pane(workspace: &serde_json::Value, panes: &serde_json::Value) -> Option<String> {
+    let panes = panes.as_array()?;
+    if workspace["tab_count"] != 1 || workspace["pane_count"] != 1 || panes.len() != 1 {
+        return None;
+    }
+    let pane = &panes[0];
+    let no_agent = pane["agent"].as_str().is_none_or(str::is_empty)
+        && pane["agent_status"].as_str().is_none_or(|s| s == "unknown");
+    let home = pane["cwd"] == HOME && pane["foreground_cwd"].as_str().is_none_or(|c| c == HOME);
+    (no_agent && home)
+        .then(|| pane["pane_id"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+/// True when the only foreground process is the pane's own shell.
+fn shell_idle(info: &serde_json::Value) -> bool {
+    let Some(shell) = info["shell_pid"].as_u64() else {
+        return false;
+    };
+    let Some(procs) = info["foreground_processes"].as_array() else {
+        return false;
+    };
+    info["foreground_process_group_id"].as_u64() == Some(shell)
+        && !procs.is_empty()
+        && procs.iter().all(|p| p["pid"].as_u64() == Some(shell))
 }
 
 pub async fn save_snapshot(client: &mut boxd::Client, vm: &str, snapshot: &str) -> Result<u64> {
@@ -384,6 +577,33 @@ pub async fn save_snapshot(client: &mut boxd::Client, vm: &str, snapshot: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_workspace_is_closed_only_when_untouched() {
+        use serde_json::json;
+        let ws = json!({"tab_count": 1, "pane_count": 1});
+        let pane = json!({"pane_id": "w2:p1", "cwd": HOME, "foreground_cwd": HOME, "agent_status": "unknown"});
+        assert_eq!(
+            sole_home_pane(&ws, &json!([pane])).as_deref(),
+            Some("w2:p1")
+        );
+        let mut moved = pane.clone();
+        moved["cwd"] = json!("/home/boxd/app");
+        assert!(sole_home_pane(&ws, &json!([moved])).is_none());
+        let mut agent = pane.clone();
+        agent["agent"] = json!("claude");
+        assert!(sole_home_pane(&ws, &json!([agent])).is_none());
+        let split = json!({"tab_count": 1, "pane_count": 2});
+        assert!(sole_home_pane(&split, &json!([pane, pane])).is_none());
+
+        let idle = json!({"shell_pid": 439, "foreground_process_group_id": 439,
+            "foreground_processes": [{"pid": 439, "name": "bash"}]});
+        assert!(shell_idle(&idle));
+        let busy = json!({"shell_pid": 439, "foreground_process_group_id": 803,
+            "foreground_processes": [{"pid": 803, "name": "sleep"}]});
+        assert!(!shell_idle(&busy));
+        assert!(!shell_idle(&json!({})));
+    }
 
     #[test]
     fn machine_name_accepts_herdr_box() {
