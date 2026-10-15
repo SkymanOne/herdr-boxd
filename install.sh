@@ -59,8 +59,10 @@ fi
 tar -xzf "$tmpdir/$archive" -C "$tmpdir"
 dest=${HERDR_BOXD_INSTALL_DIR:-$HOME/.local/bin}
 mkdir -p "$dest"
-cp "$tmpdir/herdr-boxd" "$dest/herdr-boxd"
-chmod 755 "$dest/herdr-boxd"
+staged="$dest/.herdr-boxd.$$"
+cp "$tmpdir/herdr-boxd" "$staged"
+chmod 755 "$staged"
+mv -f "$staged" "$dest/herdr-boxd"
 "$dest/herdr-boxd" --version
 
 case ":${PATH}:" in
