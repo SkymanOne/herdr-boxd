@@ -5,7 +5,7 @@
 //! runs `claude -p` or `codex exec` detached, logging to
 //! ~/.herdr-boxd/agents/<name> in the machine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -545,6 +545,140 @@ pub async fn list(client: &mut boxd::Client) -> Result<Vec<Value>> {
     statuses(client, &agents).await
 }
 
+/// Ledger agents, plus Herdr agents running on plugin machines that were not spawned here.
+pub async fn visible(client: &mut boxd::Client) -> Result<Vec<Value>> {
+    let mut listed = list(client).await?;
+    let mut seen: HashSet<(String, String)> = listed
+        .iter()
+        .filter_map(|value| {
+            Some((
+                value["machine"].as_str()?.to_owned(),
+                value["agent"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let running: HashSet<String> = client
+        .list_vms()
+        .await?
+        .vms
+        .into_iter()
+        .filter(|vm| vm.status == "running")
+        .map(|vm| vm.name)
+        .collect();
+    let profiles = herdr::profiles().unwrap_or_default();
+    let mut queried = HashSet::new();
+    for name in store::machines(&store::dirs()) {
+        if !running.contains(&name) {
+            continue;
+        }
+        let Some(profile) = profiles.iter().find(|profile| profile.is_for(&name)) else {
+            continue;
+        };
+        queried.insert(name.clone());
+        if let Ok(live) = herdr_agents(Some(&profile.id)).await {
+            push_live(&mut listed, &mut seen, &name, &live);
+        }
+    }
+    if let Some(here) = current_boxd_name() {
+        if !queried.contains(&here) {
+            if let Ok(live) = herdr_agents(None).await {
+                push_live(&mut listed, &mut seen, &here, &live);
+            }
+        }
+    }
+    Ok(listed)
+}
+
+fn current_boxd_name() -> Option<String> {
+    std::env::var("boxd_vm_name")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            std::env::var("BOXD_VM_NAME")
+                .ok()
+                .filter(|name| !name.is_empty())
+        })
+}
+
+fn push_live(
+    listed: &mut Vec<Value>,
+    seen: &mut HashSet<(String, String)>,
+    machine: &str,
+    live: &[Value],
+) {
+    for agent in live {
+        let Some(value) = live_view(machine, agent) else {
+            continue;
+        };
+        let key = (
+            value["machine"].as_str().unwrap_or_default().to_owned(),
+            value["agent"].as_str().unwrap_or_default().to_owned(),
+        );
+        if key.1.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        listed.push(value);
+    }
+}
+
+fn live_view(machine: &str, agent: &Value) -> Option<Value> {
+    let kind = agent["agent"].as_str().unwrap_or("");
+    let name = herdr_agent_name(agent)?;
+    Some(json!({
+        "agent": name,
+        "machine": machine,
+        "kind": if kind.is_empty() { name } else { kind },
+        "mode": "pane",
+        "status": agent["agent_status"].as_str().unwrap_or("unknown"),
+        "workdir": agent["cwd"].as_str().unwrap_or(""),
+        "spawned": false,
+    }))
+}
+
+fn herdr_agent_name(agent: &Value) -> Option<&str> {
+    agent["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .or_else(|| agent["agent"].as_str().filter(|name| !name.is_empty()))
+}
+
+async fn herdr_agents(profile: Option<&str>) -> Result<Vec<Value>> {
+    let value = match profile {
+        Some(profile) => {
+            herdr::remote_timeout(profile, &["agent", "list"], Duration::from_secs(20)).await?
+        }
+        None => local_herdr_agents().await?,
+    };
+    Ok(value["result"]["agents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+async fn local_herdr_agents() -> Result<Value> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(herdr::bin())
+            .args(["agent", "list"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| Coded::new("timeout", "herdr agent list timed out"))??;
+    if !output.status.success() {
+        bail!(Coded::new(
+            "herdr_failed",
+            format!(
+                "herdr agent list exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    serde_json::from_slice(&output.stdout).context("herdr agent list is not JSON")
+}
+
 // shortcut: machines are queried one after another; parallelise if people run
 // many machines at once.
 async fn statuses(client: &mut boxd::Client, agents: &[Agent]) -> Result<Vec<Value>> {
@@ -626,7 +760,7 @@ async fn pane_statuses(profile: &str) -> Result<HashMap<String, String>> {
         .flatten()
         .filter_map(|a| {
             Some((
-                a["name"].as_str()?.to_owned(),
+                herdr_agent_name(a)?.to_owned(),
                 a["agent_status"].as_str().unwrap_or("unknown").to_owned(),
             ))
         })
@@ -1026,6 +1160,24 @@ mod tests {
     #[test]
     fn sh_quote_survives_single_quotes() {
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn live_herdr_agent_uses_kind_when_unnamed() {
+        let agent = json!({
+            "agent": "yapi",
+            "agent_status": "working",
+            "cwd": "/home/boxd/herdr-boxd"
+        });
+        let view = live_view("herdr-box", &agent).unwrap();
+        assert_eq!(view["agent"], "yapi");
+        assert_eq!(view["status"], "working");
+        assert_eq!(view["machine"], "herdr-box");
+        assert_eq!(view["spawned"], false);
+        assert_eq!(
+            herdr_agent_name(&json!({"name": "fix-auth", "agent": "claude"})),
+            Some("fix-auth")
+        );
     }
 
     #[test]
