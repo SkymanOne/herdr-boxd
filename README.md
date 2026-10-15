@@ -2,9 +2,25 @@
 
 Start a [boxd](https://boxd.sh) machine from a snapshot and attach it in [Herdr](https://herdr.dev). Other agents can also use it to run coding subagents inside boxd machines and keep track of them.
 
-It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer, and Rust to build from source.
+It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer.
 
 ## Install
+
+Apple Silicon or Linux x86_64, including a boxd VM:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkymanOne/herdr-boxd/main/install.sh | sh
+```
+
+Into a VM from this computer:
+
+```bash
+boxd machine exec <vm> -- sh -c 'curl -fsSL https://raw.githubusercontent.com/SkymanOne/herdr-boxd/main/install.sh | sh'
+```
+
+`HERDR_BOXD_VERSION` selects a release. `HERDR_BOXD_INSTALL_DIR` defaults to `~/.local/bin`.
+
+The Herdr plugin on a Mac still uses `herdr plugin link` from a source checkout. The install script only puts the CLI on `PATH`.
 
 From this directory:
 

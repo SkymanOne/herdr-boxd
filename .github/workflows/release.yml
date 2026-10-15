@@ -1,0 +1,125 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - install.sh
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install protoc
+        run: |
+          if [ "$(uname -s)" = Darwin ]; then
+            brew install protobuf
+          else
+            sudo apt-get update
+            sudo apt-get install -y musl-tools protobuf-compiler
+            rustup target add x86_64-unknown-linux-musl
+          fi
+      - name: Build
+        run: |
+          if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+          fi
+          cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Smoke test
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          bin="target/${{ matrix.target }}/release/herdr-boxd"
+          got=$("$bin" --version)
+          echo "$got"
+          if [ "$got" != "herdr-boxd $version" ]; then
+            echo "expected herdr-boxd $version"
+            exit 1
+          fi
+      - name: Package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          target="${{ matrix.target }}"
+          name="herdr-boxd-${version}-${target}"
+          stage=$(mktemp -d)
+          cp "target/${target}/release/herdr-boxd" "$stage/herdr-boxd"
+          cp README.md LICENSE "$stage/"
+          tar -C "$stage" -czf "${name}.tar.gz" herdr-boxd README.md LICENSE
+          if command -v sha256sum >/dev/null 2>&1; then
+            hash=$(sha256sum "${name}.tar.gz" | awk '{print $1}')
+          else
+            hash=$(shasum -a 256 "${name}.tar.gz" | awk '{print $1}')
+          fi
+          printf '%s  %s\n' "$hash" "${name}.tar.gz" > "${name}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            herdr-boxd-*.tar.gz
+            herdr-boxd-*.tar.gz.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check tag matches Cargo.toml
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "$tag" != "$version" ]; then
+            echo "tag v${tag} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          printf '%s\n' "$version" > version.txt
+      - name: Changelog notes
+        run: |
+          version=$(cat version.txt)
+          awk -v ver="$version" '
+            $0 ~ "^## " ver "( |$)" { found = 1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md
+      - name: SHA256SUMS
+        run: cat dist/*.sha256 > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cat version.txt)
+          gh release create "v${version}" \
+            --title "v${version}" \
+            --notes-file notes.md \
+            dist/*.tar.gz \
+            SHA256SUMS \
+            install.sh
