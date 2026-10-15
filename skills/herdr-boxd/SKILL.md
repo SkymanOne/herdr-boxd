@@ -13,7 +13,7 @@ runs coding agents inside them. Every command takes `--json`; use it always.
 - Progress lines go to stderr; ignore them or show them to the user.
 
 Check it is installed with `herdr-boxd --version`. It needs a `boxd auth login`
-(or `herdr-boxd config set api-key`). Pane mode also needs Herdr 0.9.1 or newer on this
+(or `herdr-boxd config set api-key`). The plugin and pane mode need Herdr 0.9.1 or newer on this
 computer; headless mode works without Herdr, from any shell or CI.
 
 ## Two modes
@@ -132,6 +132,6 @@ CLI directly.
 `usage`, `auth` (ask the user to run `boxd auth login`), `quota`,
 `already_exists`, `not_found`, `not_owned`, `snapshot_not_found`, `busy`,
 `timeout`, `agent_not_ready`, `unavailable` and `unreachable` (retry),
-`ssh_unreachable`, `machine_gone`, `herdr_missing` (use `--headless`), `workdir_in_use` (another agent works in
+`ssh_unreachable`, `machine_gone`, `herdr_missing` (use `--headless`), `herdr_old` (install Herdr 0.9.1 or newer), `workdir_in_use` (another agent works in
 that directory; share it with `--workdir` instead of copying over it),
 `cancelled`.

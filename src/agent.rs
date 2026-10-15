@@ -69,8 +69,11 @@ pub async fn spawn(opts: SpawnOpts) -> Result<Value> {
             ),
         ));
     }
-    if !opts.headless && !herdr::available() {
-        return Err(herdr::missing());
+    if !opts.headless {
+        if !herdr::available() {
+            return Err(herdr::missing());
+        }
+        herdr::require_min()?;
     }
     if opts.headless && opts.prompt.is_none() {
         bail!(Coded::new(
@@ -235,7 +238,6 @@ async fn launch(
             ready.profile.unwrap_or_default()
         }
     };
-    let copied = packed.is_some();
     agent.workdir = match &packed {
         Some(packed) => copy::push(client, &agent.machine, packed).await?,
         None => workdir.unwrap_or_else(|| "/home/boxd".into()),
@@ -247,9 +249,6 @@ async fn launch(
         )
         .await?
         .check("creating the work directory")?;
-    if opts.machine.is_none() && copied {
-        machine::open_project_shell(&profile, &agent.workdir).await;
-    }
     let status = match agent.mode {
         Mode::Pane => spawn_pane(client, &profile, opts, agent).await?,
         Mode::Headless => spawn_headless(client, opts, agent).await?,
@@ -287,28 +286,9 @@ async fn spawn_pane(
         "opening a Herdr workspace for {} on {}",
         agent.name, agent.machine
     ));
-    let created = herdr::remote(
-        profile,
-        &[
-            "workspace",
-            "create",
-            "--cwd",
-            &agent.workdir,
-            "--label",
-            &agent.name,
-            "--no-focus",
-        ],
-    )
-    .await?;
-    let result = &created["result"];
-    let workspace = result["workspace"]["workspace_id"]
-        .as_str()
-        .context("herdr workspace create returned no workspace id")?;
-    let pane = result["root_pane"]["pane_id"]
-        .as_str()
-        .context("herdr workspace create returned no pane id")?
-        .to_owned();
-    agent.workspace = Some(workspace.to_owned());
+    let (workspace, pane) =
+        herdr::create_workspace(profile, &agent.workdir, &agent.name, false).await?;
+    agent.workspace = Some(workspace);
     store::save_agent(&store::dirs(), agent)?;
 
     ui::step(format!("starting {} in {pane}", agent.kind));

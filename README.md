@@ -2,7 +2,7 @@
 
 Start a [boxd](https://boxd.sh) machine from a snapshot and attach it in [Herdr](https://herdr.dev). Other agents can also use it to run coding subagents inside boxd machines and keep track of them.
 
-It runs on macOS and Linux. You need Herdr 0.9.1 or newer, a `boxd` login on this computer, and Rust to build from source.
+It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer, and Rust to build from source.
 
 ## Install
 
@@ -96,5 +96,11 @@ With `--json`, errors are `{"error":{"code","message"}}` on stderr. The exit cod
 
 The snapshot name defaults to `herd-base`. Auth uses the token from `boxd auth login`. If that token is rejected, set an API key. The config file is written atomically with mode `600`. The key goes to the token exchange over stdin, so it never appears in `ps`.
 
+It only manages machines it created, and it updates the snapshot only when asked.
+
 SSH: boxd's own daemon keeps `Host <name>.boxd` entries in `~/.ssh/config`. The plugin writes a fallback block only if the daemon hasn't written one. It writes atomically, preserves the file mode, and follows a symlinked config. Destroy removes the block again.
+
+## License
+
+[MIT](LICENSE)
 

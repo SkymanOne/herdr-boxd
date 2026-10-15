@@ -13,7 +13,7 @@ use tonic::{Code, Request, Status};
 use crate::{ui, Coded};
 
 pub mod proto {
-    // allow, not expect: this lint is absent on older clippy and present on 1.99.
+    // Generated clients return tonic::Status by value.
     #![allow(clippy::result_large_err)]
     tonic::include_proto!("boxd.api.v1");
 }
