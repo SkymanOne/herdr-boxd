@@ -2,11 +2,18 @@
 
 Start a [boxd](https://boxd.sh) machine from a snapshot and attach it in [Herdr](https://herdr.dev). Other agents can also use it to run coding subagents inside boxd machines and keep track of them.
 
-It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer. Rust is needed only to build the plugin from source.
+It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer, or to be inside a boxd VM. Rust and protoc are needed only to build from source when no release binary is available.
 
 ## Install
 
-Apple Silicon or Linux x86_64, including a boxd VM:
+Plugin. Pin a release with `--ref v0.2.0`. If this directory was linked, unlink it first:
+
+```bash
+herdr plugin unlink boxd.session
+herdr plugin install SkymanOne/herdr-boxd --ref v0.2.0
+```
+
+CLI only, on Apple Silicon or Linux x86_64, including a boxd VM:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SkymanOne/herdr-boxd/main/install.sh | sh
@@ -20,14 +27,11 @@ boxd machine exec <vm> -- sh -c 'curl -fsSL https://raw.githubusercontent.com/Sk
 
 `HERDR_BOXD_VERSION` selects a release. `HERDR_BOXD_INSTALL_DIR` defaults to `~/.local/bin`.
 
-The Herdr plugin on a Mac still uses `herdr plugin link` from a source checkout. The install script only puts the CLI on `PATH`.
-
-From this directory:
+Development uses a source checkout:
 
 ```bash
 cargo build --release --locked
 herdr plugin link .
-ln -sf "$PWD/target/release/herdr-boxd" ~/.local/bin/herdr-boxd   # so agents can call it
 ```
 
 Bind a key in `~/.config/herdr/config.toml` (`prefix+b` is the sidebar):
