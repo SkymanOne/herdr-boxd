@@ -109,7 +109,6 @@ pub struct Ready {
 /// A machine that exists but is not fully set up yet; `rollback` removes it.
 pub struct Created {
     name: String,
-    profile: bool,
 }
 
 /// Resolves on SIGINT, SIGTERM, or SIGHUP (the popup closing).
@@ -130,17 +129,37 @@ pub async fn interrupted() {
 }
 
 pub async fn start(client: &mut boxd::Client, plan: &Plan) -> Result<Ready> {
+    if plan.packed.is_some() && herdr::available() {
+        herdr::require_min()?;
+    }
     let mut created = None;
     let result = tokio::select! {
         result = provision(client, plan, &mut created) => result,
         () = interrupted() => Err(Coded::new("cancelled", "interrupted").into()),
     };
-    if result.is_err() {
-        if let Some(created) = created {
-            rollback(client, created).await;
+    let ready = match result {
+        Ok(ready) => ready,
+        Err(err) => {
+            if let Some(created) = created {
+                rollback(client, created).await;
+            }
+            return Err(err);
+        }
+    };
+    if plan.packed.is_some() {
+        if let Some(profile) = &ready.profile {
+            tokio::select! {
+                () = open_project_shell(profile, &ready.workdir) => {}
+                () = interrupted() => {
+                    ui::warn(format!(
+                        "interrupted while opening a shell in {}; {} is ready",
+                        ready.workdir, ready.machine
+                    ));
+                }
+            }
         }
     }
-    result
+    Ok(ready)
 }
 
 /// The un-guarded start. Callers that run their own interrupt handling pass
@@ -172,10 +191,7 @@ pub async fn provision(
 
     ui::step(format!("creating {name} from {}", plan.snapshot));
     let name = client.create_from_snapshot(&plan.snapshot, &name).await?;
-    *created = Some(Created {
-        name: name.clone(),
-        profile: false,
-    });
+    *created = Some(Created { name: name.clone() });
     store::remember(&store::dirs(), &name)?;
     let mut vm = client.wait_running(&name, Duration::from_secs(180)).await?;
 
@@ -200,11 +216,7 @@ pub async fn provision(
         ui::step("waiting for SSH");
         connect_ssh(client, &name, &vm).await?;
         ui::step(format!("adding {name} to Herdr"));
-        let profile = herdr::ensure_profile(&name)?;
-        if let Some(created) = created.as_mut() {
-            created.profile = true;
-        }
-        Some(profile)
+        Some(herdr::ensure_profile(&name).await?)
     } else {
         ui::note("Herdr is not installed here, so the machine is not added to a sidebar");
         None
@@ -255,10 +267,8 @@ fn daemon_manages_ssh() -> bool {
 pub async fn rollback(client: &mut boxd::Client, created: Created) {
     let name = created.name;
     ui::warn(format!("cleaning up {name}"));
-    if created.profile {
-        if let Err(err) = herdr::remove_profile(&name) {
-            ui::warn(format!("could not remove the Herdr profile: {err:#}"));
-        }
+    if let Err(err) = herdr::remove_profile(&name) {
+        ui::warn(format!("could not remove the Herdr profile: {err:#}"));
     }
     let _ = ssh::remove(&name);
     match client.destroy(&name).await {
@@ -278,9 +288,10 @@ pub async fn attach(client: &mut boxd::Client, name: &str) -> Result<String> {
     if !herdr::available() {
         return Err(herdr::missing());
     }
+    herdr::require_min()?;
     let vm = client.ensure_running(name).await?;
     connect_ssh(client, name, &vm).await?;
-    let profile = herdr::ensure_profile(name)?;
+    let profile = herdr::ensure_profile(name).await?;
     herdr::wait_reachable(&profile, Duration::from_secs(60)).await?;
     Ok(profile)
 }
@@ -343,6 +354,26 @@ pub async fn list(client: &mut boxd::Client) -> Result<Vec<Listed>> {
             }
         })
         .collect())
+}
+
+pub async fn open_project_shell(profile: &str, workdir: &str) {
+    if profile.is_empty() {
+        return;
+    }
+    if let Err(err) = focus_project_shell(profile, workdir).await {
+        ui::warn(format!("could not open a shell in {workdir}: {err:#}"));
+    }
+}
+
+async fn focus_project_shell(profile: &str, workdir: &str) -> Result<()> {
+    ui::step(format!("opening a shell in {workdir}"));
+    herdr::wait_reachable(profile, Duration::from_secs(60)).await?;
+    let label = workdir
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(workdir);
+    herdr::create_workspace(profile, workdir, label, true).await?;
+    Ok(())
 }
 
 pub async fn save_snapshot(client: &mut boxd::Client, vm: &str, snapshot: &str) -> Result<u64> {

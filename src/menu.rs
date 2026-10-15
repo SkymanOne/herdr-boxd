@@ -295,11 +295,11 @@ async fn agents() -> Result<()> {
         ui::clear();
         ui::out(ui::bold("Agents"));
         ui::out(ui::dim(
-            "Spawned with `herdr-boxd agent spawn`. Pane agents also show in the machine's Herdr sidebar.",
+            "Herdr agents on these machines. x stops ones started with `herdr-boxd agent spawn`.",
         ));
         ui::out("");
         let mut client = machine::connect().await?;
-        let list = agent::list(&mut client).await?;
+        let list = agent::visible(&mut client).await?;
         if list.is_empty() {
             ui::out(ui::dim("  no agents"));
         }
@@ -323,7 +323,14 @@ async fn agents() -> Result<()> {
                     Ok(name) => name,
                     Err(_) => continue,
                 };
-                let found = agent::find(&name)?;
+                let found = match agent::find(&name) {
+                    Ok(found) => found,
+                    Err(_) => {
+                        ui::warn(format!("{name} was not started by herdr-boxd"));
+                        ui::pause();
+                        continue;
+                    }
+                };
                 let destroy = found.owns_machine
                     && ui::confirm(&format!("Also destroy {}?", found.machine), false)?;
                 agent::stop(&mut client, &found, destroy).await?;

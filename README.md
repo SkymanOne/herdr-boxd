@@ -2,9 +2,25 @@
 
 Start a [boxd](https://boxd.sh) machine from a snapshot and attach it in [Herdr](https://herdr.dev). Other agents can also use it to run coding subagents inside boxd machines and keep track of them.
 
-It runs on macOS and Linux. You need Herdr 0.9.0 or newer, a `boxd` login on this computer, and Rust to build from source.
+It runs on macOS and Linux. The plugin and pane mode need Herdr 0.9.1 or newer. Headless use works without Herdr. You also need a `boxd` login on this computer. Rust is needed only to build the plugin from source.
 
 ## Install
+
+Apple Silicon or Linux x86_64, including a boxd VM:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkymanOne/herdr-boxd/main/install.sh | sh
+```
+
+Into a VM from this computer:
+
+```bash
+boxd machine exec <vm> -- sh -c 'curl -fsSL https://raw.githubusercontent.com/SkymanOne/herdr-boxd/main/install.sh | sh'
+```
+
+`HERDR_BOXD_VERSION` selects a release. `HERDR_BOXD_INSTALL_DIR` defaults to `~/.local/bin`.
+
+The Herdr plugin on a Mac still uses `herdr plugin link` from a source checkout. The install script only puts the CLI on `PATH`.
 
 From this directory:
 
@@ -14,11 +30,11 @@ herdr plugin link .
 ln -sf "$PWD/target/release/herdr-boxd" ~/.local/bin/herdr-boxd   # so agents can call it
 ```
 
-Bind a key in `~/.config/herdr/config.toml`:
+Bind a key in `~/.config/herdr/config.toml` (`prefix+b` is the sidebar):
 
 ```toml
 [[keys.command]]
-key = "prefix+b"
+key = "prefix+m"
 type = "plugin_action"
 command = "boxd.session.menu"
 description = "Boxd menu"
@@ -42,7 +58,7 @@ The menu lists your plugin machines with their live status. Press a key; no Ente
 
 Start asks for a name (blank lets boxd pick one), a size (Enter gives 2 vCPU / 8 GB), and whether to copy the focused pane's project. Then it shows a summary. Nothing is created until you confirm.
 
-- **Copy** is git-aware. In a repo it sends tracked files, plus untracked files that aren't ignored, plus `.git`. Outside a repo it skips `target`, `node_modules`, `.venv`, and similar directories. It asks first if the upload is over 500 MB. It never copies `/` or your home directory.
+- **Copy** is git-aware. In a repo it sends tracked files, plus untracked files that aren't ignored, plus `.git`. Outside a repo it skips `target`, `node_modules`, `.venv`, and similar directories. It asks first if the upload is over 500 MB. It never copies `/` or your home directory. The shell opens in that directory, not `/home/boxd`.
 - **Size.** A snapshot restore keeps the snapshot's size. Any other size costs one quick reboot.
 - **Hostname.** If the size already matches, there is no reboot. The plugin restarts the machine's Herdr server instead, so shells that were restored from the snapshot pick up the new hostname.
 - **If anything fails, or you close the popup or press Ctrl-C** after the machine exists, the plugin destroys it again. You never pay for a half-set-up machine.
@@ -96,8 +112,11 @@ With `--json`, errors are `{"error":{"code","message"}}` on stderr. The exit cod
 
 The snapshot name defaults to `herd-base`. Auth uses the token from `boxd auth login`. If that token is rejected, set an API key. The config file is written atomically with mode `600`. The key goes to the token exchange over stdin, so it never appears in `ps`.
 
+It only manages machines it created, and it updates the snapshot only when asked.
+
 SSH: boxd's own daemon keeps `Host <name>.boxd` entries in `~/.ssh/config`. The plugin writes a fallback block only if the daemon hasn't written one. It writes atomically, preserves the file mode, and follows a symlinked config. Destroy removes the block again.
 
-## What it does not do
+## License
 
-It does not touch boxd machines it did not create. It does not update the snapshot unless you ask it to.
+[MIT](LICENSE)
+

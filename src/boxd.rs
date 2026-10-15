@@ -13,8 +13,8 @@ use tonic::{Code, Request, Status};
 use crate::{ui, Coded};
 
 pub mod proto {
-    // Generated client methods return tonic::Status by value. Boxing that is tonic's job.
-    #![expect(clippy::result_large_err)]
+    // Generated clients return tonic::Status by value.
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("boxd.api.v1");
 }
 
