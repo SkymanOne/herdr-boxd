@@ -9,11 +9,15 @@ service BoxdApi {
   rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
   rpc DestroyVm(DestroyVmRequest) returns (DestroyVmResponse);
   rpc RebootVm(RebootVmRequest) returns (RebootVmResponse);
+  rpc StartVm(StartVmRequest) returns (StartVmResponse);
+  rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
+  rpc WakeVm(WakeVmRequest) returns (WakeVmResponse);
   rpc ResizeVm(ResizeVmRequest) returns (ResizeVmResponse);
   rpc SuggestVmName(SuggestVmNameRequest) returns (SuggestVmNameResponse);
   rpc CreateVmFromSnapshot(CreateVmFromSnapshotRequest) returns (CreateVmResponse);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
   rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  rpc UploadFile(UploadFileRequest) returns (UploadFileResponse);
   rpc UploadFileStream(stream UploadFileChunk) returns (UploadFileResponse);
   rpc Exec(stream ExecChunk) returns (stream ExecChunk);
 }
@@ -48,6 +52,12 @@ message DestroyVmRequest { string vm_id = 1; }
 message DestroyVmResponse {}
 message RebootVmRequest { string vm_id = 1; }
 message RebootVmResponse {}
+message StartVmRequest { string vm_id = 1; }
+message StartVmResponse {}
+message ResumeVmRequest { string vm_id = 1; }
+message ResumeVmResponse { uint64 resume_us = 1; }
+message WakeVmRequest { string vm_id = 1; }
+message WakeVmResponse {}
 message ResizeVmRequest {
   string vm_id = 1;
   uint32 vcpu = 2;
@@ -104,6 +114,11 @@ message UploadFileChunk {
   string path = 2;
   uint64 total_size = 3;
   bytes data = 4;
+}
+message UploadFileRequest {
+  string vm_id = 1;
+  string path = 2;
+  bytes data = 3;
 }
 message UploadFileResponse {
   uint64 bytes_written = 1;
