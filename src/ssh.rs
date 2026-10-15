@@ -1,9 +1,11 @@
 //! SSH aliases for plugin machines. The boxd client daemon normally writes
 //! `Host <name>.boxd` entries itself; this module only writes a fallback block
-//! when `ssh -G` shows the alias does not resolve yet.
+//! when `ssh -G` shows the alias does not resolve yet. Inside a boxd VM there
+//! is no daemon and no key, so the plugin makes its own key and links it.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -16,7 +18,22 @@ pub fn alias(name: &str) -> String {
     format!("{name}.boxd")
 }
 
+/// The plugin's own key inside a boxd VM; `machine::ensure_identity` makes it.
+pub fn vm_key() -> io::Result<PathBuf> {
+    Ok(home()?.join(".ssh/herdr-boxd_ed25519"))
+}
+
 pub fn identity_file() -> io::Result<PathBuf> {
+    if crate::boxd::in_vm() {
+        let key = vm_key()?;
+        if key.exists() {
+            return Ok(key);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} does not exist yet", key.display()),
+        ));
+    }
     let home = home()?;
     for dir in [
         "Library/Application Support/boxd",
@@ -46,10 +63,38 @@ pub fn identity_file() -> io::Result<PathBuf> {
     ))
 }
 
+/// Creates `key` (ed25519, no passphrase, mode 600) unless it exists, and
+/// returns the public key line.
+pub fn generate_key(key: &Path, comment: &str) -> Result<String> {
+    if !key.exists() {
+        if let Some(dir) = key.parent() {
+            fs::create_dir_all(dir)?;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let output = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", comment, "-f"])
+            .arg(key)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|err| anyhow::anyhow!("run ssh-keygen: {err}"))?;
+        if !output.status.success() {
+            bail!(
+                "ssh-keygen failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    fs::set_permissions(key, fs::Permissions::from_mode(0o600))?;
+    let public = fs::read_to_string(key.with_extension("pub"))?;
+    Ok(public.trim().to_owned())
+}
+
 /// Makes `<name>.boxd` reach `host:port`. Returns true if a fallback block was
 /// written (boxd's daemon had not added the alias yet).
 pub fn ensure_alias(name: &str, host: &str, port: u32, host_key: &str) -> Result<bool> {
-    if resolves_to(name, host, port) {
+    // Inside a VM the alias is also the machine's private DNS name, so it
+    // always "resolves"; the block is what adds our key.
+    if !crate::boxd::in_vm() && resolves_to(name, host, port) {
         return Ok(false);
     }
     let alias = alias(name);
@@ -194,7 +239,6 @@ fn strip_block(text: &str, alias: &str) -> String {
 }
 
 fn write_preserving_mode(path: &Path, text: &str) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(0o600);
@@ -202,19 +246,26 @@ fn write_preserving_mode(path: &Path, text: &str) -> io::Result<()> {
 }
 
 fn append_known_host(path: &Path, host: &str, port: u32, host_key: &str) -> io::Result<()> {
-    let marker = format!("[{host}]:{port} ");
+    // ssh looks port 22 up by the bare host name.
+    let marker = if port == 22 {
+        format!("{host} ")
+    } else {
+        format!("[{host}]:{port} ")
+    };
+    let line = format!("{marker}{host_key}");
     let existing = fs::read_to_string(path).unwrap_or_default();
-    if existing.lines().any(|line| line.starts_with(&marker)) {
+    if existing.lines().any(|old| old == line) {
         return Ok(());
     }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        writeln!(file)?;
-    }
-    writeln!(file, "{marker}{host_key}")
+    // A machine recreated under the same name can have a new host key.
+    let mut text: String = existing
+        .lines()
+        .filter(|old| !old.starts_with(&marker))
+        .map(|old| format!("{old}\n"))
+        .collect();
+    text.push_str(&line);
+    text.push('\n');
+    write_preserving_mode(path, &text)
 }
 
 pub fn warn_fallback(name: &str) {
@@ -241,6 +292,22 @@ mod tests {
     fn strip_block_keeps_text_when_the_end_marker_is_missing() {
         let text = "# herdr-boxd begin a.boxd\nHost a.boxd\nHost mine\n";
         assert_eq!(strip_block(text, "a.boxd"), text);
+    }
+
+    #[test]
+    fn known_host_replaces_a_stale_key_for_the_same_host() {
+        let dir = std::env::temp_dir().join(format!("herdr-boxd-kh-{}", store::random_hex(4)));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        fs::write(&path, "other ssh-ed25519 X\na.boxd ssh-ed25519 OLD\n").unwrap();
+        append_known_host(&path, "a.boxd", 22, "ssh-ed25519 NEW").unwrap();
+        append_known_host(&path, "a.boxd", 22, "ssh-ed25519 NEW").unwrap();
+        append_known_host(&path, "b.boxd.sh", 2222, "ssh-ed25519 G").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "other ssh-ed25519 X\na.boxd ssh-ed25519 NEW\n[b.boxd.sh]:2222 ssh-ed25519 G\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

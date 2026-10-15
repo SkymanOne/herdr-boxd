@@ -6,6 +6,7 @@ mod machine;
 mod menu;
 mod ssh;
 mod store;
+mod tree;
 mod ui;
 
 use std::borrow::Cow;
@@ -28,10 +29,13 @@ usage: herdr-boxd [--json] <command>
 
 machines
   start [--name N] [--size 1x4|2x8|4x16|8x32] [--cwd PATH] [--copy|--no-copy]
-  list                          machines this plugin created, with live status
+  list [--orphans]              machines this plugin created, and theirs, as a tree;
+                                --orphans: account machines no ledger here tracks
   attach MACHINE                wake a machine and reconnect it to Herdr
+  sync                          add every running machine in the tree to Herdr,
+                                remove profiles of machines that are gone
   update [MACHINE] [--yes]      save a machine back to the configured snapshot
-  destroy MACHINE [--yes]
+  destroy MACHINE [--yes]       also destroys the machines it created
 
 agents (see `herdr-boxd --skill`)
   agent spawn [--name A] [--kind claude] [--machine M | --size S] [--cwd PATH]
@@ -40,7 +44,7 @@ agents (see `herdr-boxd --skill`)
   agent list | status A | wait A [--timeout MS] | read A [--lines N]
   agent prompt A (TEXT | --prompt-file F|-) [--wait] [--timeout MS]
   agent keys A KEY...           pane agents only, e.g. `agent keys a down enter`
-  agent stop A [--destroy]
+  agent stop A [--destroy [--yes]]
 
 config
   config show
@@ -150,6 +154,7 @@ async fn run(raw: Vec<String>) -> Result<()> {
         "start" => start_cmd(raw).await,
         "attach" => attach_cmd(raw).await,
         "list" | "ls" => list_cmd(raw).await,
+        "sync" => sync_cmd(raw).await,
         "update" | "save" => update_cmd(raw).await,
         "destroy" | "rm" => destroy_cmd(raw).await,
         "agent" | "agents" => agent_cmd(raw).await,
@@ -459,6 +464,9 @@ pub async fn start_flow(request: StartRequest) -> Result<()> {
         attach_herdr: true,
     };
     let ready = machine::start(&mut client, &plan).await?;
+    if ready.profile.is_some() {
+        tree::sync_best_effort(&mut client).await;
+    }
     if ui::json() {
         ui::print_json(&serde_json::to_value(&ready)?);
     } else {
@@ -514,9 +522,12 @@ async fn attach_cmd(raw: Vec<String>) -> Result<()> {
 }
 
 async fn list_cmd(raw: Vec<String>) -> Result<()> {
-    Args::parse(raw, &[], &[])?;
+    let args = Args::parse(raw, &[], &["orphans"])?;
     let mut client = machine::connect().await?;
-    let machines = machine::list(&mut client).await?;
+    if args.flag("orphans") {
+        return orphans(&mut client).await;
+    }
+    let machines = tree::list(&mut client).await?;
     if ui::json() {
         ui::print_json(&serde_json::to_value(&machines)?);
         return Ok(());
@@ -527,6 +538,57 @@ async fn list_cmd(raw: Vec<String>) -> Result<()> {
     }
     for line in menu::machine_lines(&machines) {
         ui::out(line);
+    }
+    Ok(())
+}
+
+async fn orphans(client: &mut boxd::Client) -> Result<()> {
+    let (orphans, partial) = tree::orphans(client).await?;
+    if ui::json() {
+        ui::print_json(&json!(orphans));
+        return Ok(());
+    }
+    if orphans.is_empty() {
+        ui::out("no orphans: every machine on the account is tracked");
+    }
+    let width = orphans.iter().map(|o| o.name.len()).max().unwrap_or(0);
+    for orphan in &orphans {
+        ui::out(format!(
+            "{:width$}  {:11} {}",
+            orphan.name, orphan.status, orphan.size
+        ));
+    }
+    if partial {
+        ui::note("some machines in the tree are asleep or unreachable; machines they created may show here");
+    }
+    if !orphans.is_empty() {
+        ui::note("no herdr-boxd ledger reachable from here tracks these; they may be yours from elsewhere");
+    }
+    Ok(())
+}
+
+async fn sync_cmd(raw: Vec<String>) -> Result<()> {
+    Args::parse(raw, &[], &[])?;
+    let mut client = machine::connect().await?;
+    let synced = tree::sync(&mut client).await?;
+    if ui::json() {
+        ui::print_json(&serde_json::to_value(&synced)?);
+        return Ok(());
+    }
+    for name in &synced.added {
+        ui::done(format!("added {name} to Herdr"));
+    }
+    for name in &synced.removed {
+        ui::done(format!("removed {name} from Herdr (the machine is gone)"));
+    }
+    if synced.added.is_empty() && synced.removed.is_empty() && synced.failed.is_empty() {
+        ui::done("Herdr already lists every running machine");
+    }
+    if !synced.failed.is_empty() {
+        bail!(Coded::new(
+            "sync_failed",
+            "some machines could not be added"
+        ));
     }
     Ok(())
 }
@@ -562,14 +624,22 @@ async fn destroy_cmd(raw: Vec<String>) -> Result<()> {
     let mut args = Args::parse(raw, &[], &["yes"])?;
     let name = args.one("machine name")?;
     machine::require_owned(&name)?;
-    confirm_or_yes(
-        args.flag("yes"),
-        &format!("Destroy {name}? This deletes the machine and its disk."),
-    )?;
+    // Fail before the walk below wakes anything.
+    if !args.flag("yes") && !ui::interactive() {
+        return Err(usage("this is destructive; pass --yes to confirm"));
+    }
     let mut client = machine::connect().await?;
-    let existed = machine::destroy(&mut client, &name).await?;
+    let below = tree::descendants(&mut client, &name).await?;
+    confirm_or_yes(args.flag("yes"), &destroy_question(&name, &below))?;
+    let existed = machine::destroy_tree(&mut client, &name, &below).await?;
+    let descendants: Vec<&str> = tree::deepest_first(&below)
+        .into_iter()
+        .map(|node| node.name.as_str())
+        .collect();
     if ui::json() {
-        ui::print_json(&json!({ "machine": name, "destroyed": existed }));
+        ui::print_json(
+            &json!({ "machine": name, "destroyed": existed, "descendants": descendants }),
+        );
     } else if existed {
         ui::done(format!("destroyed {name}"));
     } else {
@@ -578,8 +648,25 @@ async fn destroy_cmd(raw: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Names every machine a destroy takes with it.
+pub fn destroy_question(name: &str, below: &[machine::Listed]) -> String {
+    let doomed: Vec<&str> = tree::deepest_first(below)
+        .into_iter()
+        .map(|node| node.name.as_str())
+        .collect();
+    if doomed.is_empty() {
+        return format!("Destroy {name}? This deletes the machine and its disk.");
+    }
+    format!(
+        "Destroy {name} and the {} machine{} it created ({})? Their disks are deleted.",
+        doomed.len(),
+        if doomed.len() == 1 { "" } else { "s" },
+        doomed.join(", ")
+    )
+}
+
 /// Destructive commands need --yes unless a person can answer the question.
-fn confirm_or_yes(yes: bool, question: &str) -> Result<()> {
+pub fn confirm_or_yes(yes: bool, question: &str) -> Result<()> {
     if yes {
         return Ok(());
     }
@@ -683,7 +770,8 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
         "list" | "ls" => {
             Args::parse(raw, &[], &[])?;
             let mut client = machine::connect().await?;
-            let agents = agent::list(&mut client).await?;
+            let mut agents = agent::list(&mut client).await?;
+            agents.extend(tree::remote_agents(&mut client).await?);
             if ui::json() {
                 ui::print_json(&json!(agents));
             } else if agents.is_empty() {
@@ -771,10 +859,11 @@ async fn agent_cmd(raw: Vec<String>) -> Result<()> {
             }
         }
         "stop" | "rm" => {
-            let mut args = Args::parse(raw, &[], &["destroy"])?;
+            let mut args = Args::parse(raw, &[], &["destroy", "yes"])?;
             let agent = agent::find(&args.one("agent name")?)?;
             let mut client = machine::connect().await?;
-            let value = agent::stop(&mut client, &agent, args.flag("destroy")).await?;
+            let value =
+                agent::stop(&mut client, &agent, args.flag("destroy"), args.flag("yes")).await?;
             if ui::json() {
                 ui::print_json(&value);
             } else {

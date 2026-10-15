@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::boxd::{self, proto::GetVmResponse};
 use crate::copy::{self, Packed};
@@ -171,7 +171,7 @@ pub async fn provision(
     // Everything that can fail cheaply runs before the machine exists.
     let herdr = plan.attach_herdr && herdr::available();
     if herdr {
-        ssh::identity_file()?;
+        ensure_identity()?;
     }
     client.check_snapshot(&plan.snapshot).await?;
     let name = match &plan.name {
@@ -234,7 +234,36 @@ pub async fn provision(
     })
 }
 
+/// The SSH key to use. Outside a VM that is boxd's own key; inside one, the
+/// plugin's key, made once. Returns the public key line inside a VM.
+pub fn ensure_identity() -> Result<Option<String>> {
+    if !boxd::in_vm() {
+        ssh::identity_file()?;
+        return Ok(None);
+    }
+    let host = store::host_name().unwrap_or_else(|| "boxd-vm".into());
+    let pubkey = ssh::generate_key(&ssh::vm_key()?, &format!("herdr-boxd@{host}"))?;
+    Ok(Some(pubkey))
+}
+
+/// Run in the machine over exec: trust our key, start a key-only sshd (boxd
+/// machines ship it masked), and print the host key to pin.
+const SSHD_SETUP: &str = r#"set -e
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+grep -qxF "$KEY" ~/.ssh/authorized_keys || printf '%s\n' "$KEY" >> ~/.ssh/authorized_keys
+if ! systemctl is-active --quiet ssh.service; then
+  printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n' |
+    sudo tee /etc/ssh/sshd_config.d/herdr-boxd.conf >/dev/null
+  sudo systemctl unmask ssh.service >/dev/null 2>&1 || true
+  sudo systemctl enable --now ssh.service >/dev/null 2>&1
+fi
+cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub"#;
+
 async fn connect_ssh(client: &mut boxd::Client, name: &str, vm: &GetVmResponse) -> Result<()> {
+    if let Some(pubkey) = ensure_identity()? {
+        return connect_private(client, name, &pubkey).await;
+    }
     let domain = if vm.access_domain.is_empty() {
         "boxd.sh"
     } else {
@@ -253,6 +282,26 @@ async fn connect_ssh(client: &mut boxd::Client, name: &str, vm: &GetVmResponse) 
     if ssh::ensure_alias(name, &host, vm.ssh_port, &host_key)? {
         ssh::warn_fallback(name);
     }
+    ssh::wait_ready(name, Duration::from_secs(120)).await
+}
+
+/// Inside a VM, boxd's SSH gateway is closed to us: it only takes keys linked
+/// by an interactive login, which a VM token cannot do. So the machine gets
+/// our key and an sshd over the authenticated exec stream, and we reach it on
+/// the private network, where `<name>.boxd` resolves to its address. The host
+/// key is pinned from that same exec, before the first connection.
+async fn connect_private(client: &mut boxd::Client, name: &str, pubkey: &str) -> Result<()> {
+    let script = format!("KEY={}\n{SSHD_SETUP}", crate::agent::sh_quote(pubkey));
+    let host_key = client
+        .exec(name, &script)
+        .await?
+        .check("setting up SSH")?
+        .stdout_text();
+    let host_key = host_key.trim();
+    if !host_key.starts_with("ssh-") {
+        bail!("{name} printed no SSH host key");
+    }
+    ssh::ensure_alias(name, &ssh::alias(name), 22, host_key)?;
     ssh::wait_ready(name, Duration::from_secs(120)).await
 }
 
@@ -319,14 +368,46 @@ pub async fn destroy(client: &mut boxd::Client, name: &str) -> Result<bool> {
     Ok(existed)
 }
 
-#[derive(Serialize, Clone)]
+/// Destroys what `name` created (`below`, from `tree::descendants`) deepest
+/// first, then `name`. A failure stops before `name`, so a retry finds the
+/// rest still tracked.
+pub async fn destroy_tree(client: &mut boxd::Client, name: &str, below: &[Listed]) -> Result<bool> {
+    for node in crate::tree::deepest_first(below) {
+        ui::step(format!(
+            "destroying {} (created by {})",
+            node.name, node.parent
+        ));
+        client.destroy(&node.name).await?;
+        // `sync` may have added it here too.
+        if let Err(err) = herdr::remove_profile(&node.name) {
+            ui::warn(format!("could not remove the Herdr profile: {err:#}"));
+        }
+        let _ = ssh::remove(&node.name);
+    }
+    destroy(client, name).await
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Listed {
     pub name: String,
     /// boxd status, or "gone" when the machine no longer exists.
     pub status: String,
     pub size: Option<String>,
+    /// Whether the host that tracks this machine has it in Herdr.
     pub in_herdr: bool,
     pub agents: usize,
+    /// The host that created it; empty at the root.
+    #[serde(default)]
+    pub parent: String,
+    /// Machines this one created, found by running herdr-boxd inside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Listed>,
+    /// Why its own machines could not be listed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<String>,
+    /// herdr-boxd answered inside it, so it can host agents of its own.
+    #[serde(skip)]
+    pub manages: bool,
 }
 
 pub async fn list(client: &mut boxd::Client) -> Result<Vec<Listed>> {
@@ -340,15 +421,25 @@ pub async fn list(client: &mut boxd::Client) -> Result<Vec<Listed>> {
         .collect();
     let profiles = herdr::profiles().unwrap_or_default();
     let agents = store::agents(&dirs);
-    Ok(store::machines(&dirs)
+    let here = store::host_name().unwrap_or_default();
+    Ok(store::entries(&dirs)
         .into_iter()
-        .map(|name| {
+        .map(|entry| {
+            let name = entry.name;
             let vm = vms.get(&name);
             Listed {
                 status: vm.map_or("gone".into(), |vm| vm.status.clone()),
                 size: vm.map(|vm| size_label(vm.vcpu, vm.memory_bytes)),
                 in_herdr: profiles.iter().any(|p| p.is_for(&name)),
                 agents: agents.iter().filter(|a| a.machine == name).count(),
+                parent: if entry.parent.is_empty() {
+                    here.clone()
+                } else {
+                    entry.parent
+                },
+                children: Vec::new(),
+                unreachable: None,
+                manages: false,
                 name,
             }
         })

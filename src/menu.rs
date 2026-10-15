@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::machine::{self, Listed, Size, SIZES};
 use crate::ui::{self, Key};
-use crate::{agent, store, Coded, CopyChoice, StartRequest};
+use crate::{agent, store, tree, Coded, CopyChoice, StartRequest};
 
 pub async fn run(screen: Option<&str>) -> Result<()> {
     let screen = screen
@@ -78,6 +78,13 @@ async fn home() -> Result<()> {
             Key::Char('3') => update().await,
             Key::Char('4') => destroy().await,
             Key::Char('5') => agents().await,
+            Key::Char('r') => {
+                ui::step("syncing Herdr machines");
+                if let Ok(mut client) = machine::connect().await {
+                    tree::sync_best_effort(&mut client).await;
+                }
+                continue;
+            }
             Key::Char('q') | Key::Cancel => return Ok(()),
             _ => continue,
         };
@@ -100,15 +107,39 @@ fn header() {
 
 async fn fetch_machines() -> Result<Vec<Listed>> {
     let mut client = machine::connect().await?;
-    machine::list(&mut client).await
+    tree::list(&mut client).await
 }
 
+/// Every machine with its depth, parents before children.
+fn rows(machines: &[Listed], depth: usize, out: &mut Vec<(usize, Listed)>) {
+    for m in machines {
+        out.push((depth, m.clone()));
+        rows(&m.children, depth + 1, out);
+    }
+}
+
+/// One line per machine; the machines each one created are indented below it.
 pub fn machine_lines(machines: &[Listed]) -> Vec<String> {
     let herdr = crate::herdr::available();
-    let width = machines.iter().map(|m| m.name.len()).max().unwrap_or(0);
-    machines
+    let profiles = if herdr {
+        crate::herdr::profiles().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let in_herdr_here = |name: &str| profiles.iter().any(|p| p.is_for(name));
+    let mut all = Vec::new();
+    rows(machines, 0, &mut all);
+    let label = |depth: usize, name: &str| match depth {
+        0 => name.to_owned(),
+        _ => format!("{}└ {name}", "  ".repeat(depth - 1)),
+    };
+    let width = all
         .iter()
-        .map(|m| {
+        .map(|(depth, m)| label(*depth, &m.name).chars().count())
+        .max()
+        .unwrap_or(0);
+    all.iter()
+        .map(|(depth, m)| {
             let dot = match m.status.as_str() {
                 "running" => ui::paint("32", "●"),
                 "gone" => ui::paint("31", "●"),
@@ -125,14 +156,21 @@ pub fn machine_lines(machines: &[Listed]) -> Vec<String> {
                     if m.agents == 1 { "" } else { "s" }
                 ));
             }
+            if let Some(reason) = &m.unreachable {
+                extra.push(format!("its machines are unknown: {reason}"));
+            }
             if m.status == "gone" {
                 extra.push("destroyed outside the plugin; destroy to clean up".into());
-            } else if herdr && !m.in_herdr {
+            } else if *depth == 0 && herdr && !m.in_herdr {
                 extra.push("not in Herdr; `herdr-boxd attach` fixes it".into());
+            } else if *depth > 0 && herdr && m.status == "running" && !in_herdr_here(&m.name) {
+                extra.push("not in Herdr here; `herdr-boxd sync` adds it".into());
             }
+            let name = label(*depth, &m.name);
+            let pad = width.saturating_sub(name.chars().count());
             format!(
-                "{dot} {:width$}  {:11} {}",
-                m.name,
+                "{dot} {name}{}  {:11} {}",
+                " ".repeat(pad),
                 m.status,
                 ui::dim(extra.join(" · "))
             )
@@ -274,14 +312,15 @@ async fn destroy() -> Result<()> {
     } else {
         String::new()
     };
+    let mut client = machine::connect().await?;
+    let below = tree::descendants(&mut client, &name).await?;
     if !ui::confirm(
-        &format!("Destroy {name}? The machine and its disk are deleted.{warning}"),
+        &format!("{}{warning}", crate::destroy_question(&name, &below)),
         false,
     )? {
         bail!(Coded::new("cancelled", "cancelled"));
     }
-    let mut client = machine::connect().await?;
-    let existed = machine::destroy(&mut client, &name).await?;
+    let existed = machine::destroy_tree(&mut client, &name, &below).await?;
     ui::done(if existed {
         format!("destroyed {name}")
     } else {
@@ -333,7 +372,7 @@ async fn agents() -> Result<()> {
                 };
                 let destroy = found.owns_machine
                     && ui::confirm(&format!("Also destroy {}?", found.machine), false)?;
-                agent::stop(&mut client, &found, destroy).await?;
+                agent::stop(&mut client, &found, destroy, false).await?;
                 ui::done(format!("stopped {name}"));
                 ui::pause();
             }
@@ -351,12 +390,16 @@ fn agent_line(value: &Value) -> String {
         "blocked" => "33",
         _ => "31",
     };
+    let via = value["host"]
+        .as_str()
+        .map(|host| format!(" · via {host}"))
+        .unwrap_or_default();
     format!(
         "{:16} {} {}",
         value["agent"].as_str().unwrap_or("?"),
         ui::paint(color, format!("{status:10}")),
         ui::dim(format!(
-            "{} {} on {} · {}",
+            "{} {} on {} · {}{via}",
             value["mode"].as_str().unwrap_or(""),
             value["kind"].as_str().unwrap_or(""),
             value["machine"].as_str().unwrap_or(""),

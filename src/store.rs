@@ -188,14 +188,40 @@ fn ledger_path(dirs: &Dirs) -> PathBuf {
     dirs.state.join("machines")
 }
 
-pub fn machines(dirs: &Dirs) -> Vec<String> {
+/// The boxd machine this runs on, or None on a laptop. The lowercase name is
+/// a fallback only: machines made from a snapshot inherit a stale one.
+pub fn host_name() -> Option<String> {
+    ["BOXD_VM_NAME", "boxd_vm_name"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok().filter(|name| !name.is_empty()))
+}
+
+/// A machine this host created. `parent` is the host that created it, empty
+/// when that was not a boxd machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub parent: String,
+}
+
+/// One machine per line, `name` or `name<TAB>parent`. Root entries keep the
+/// bare name so older versions still read the file.
+pub fn entries(dirs: &Dirs) -> Vec<Entry> {
     fs::read_to_string(ledger_path(dirs))
         .unwrap_or_default()
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(Entry {
+                name: fields.next()?.to_owned(),
+                parent: fields.next().unwrap_or_default().to_owned(),
+            })
+        })
         .collect()
+}
+
+pub fn machines(dirs: &Dirs) -> Vec<String> {
+    entries(dirs).into_iter().map(|entry| entry.name).collect()
 }
 
 pub fn owns(dirs: &Dirs, name: &str) -> bool {
@@ -204,21 +230,24 @@ pub fn owns(dirs: &Dirs, name: &str) -> bool {
 
 pub fn remember(dirs: &Dirs, name: &str) -> io::Result<()> {
     locked(&state_lock(dirs), || {
-        let mut names = machines(dirs);
-        if !names.iter().any(|existing| existing == name) {
-            names.push(name.to_owned());
+        let mut all = entries(dirs);
+        if !all.iter().any(|existing| existing.name == name) {
+            all.push(Entry {
+                name: name.to_owned(),
+                parent: host_name().unwrap_or_default(),
+            });
         }
-        write_machines(dirs, &names)
+        write_machines(dirs, &all)
     })
 }
 
 pub fn forget(dirs: &Dirs, name: &str) -> io::Result<()> {
     locked(&state_lock(dirs), || {
-        let names: Vec<String> = machines(dirs)
+        let kept: Vec<Entry> = entries(dirs)
             .into_iter()
-            .filter(|existing| existing != name)
+            .filter(|existing| existing.name != name)
             .collect();
-        write_machines(dirs, &names)?;
+        write_machines(dirs, &kept)?;
         let agents: Vec<Agent> = load_agents(dirs)?
             .into_iter()
             .filter(|agent| agent.machine != name)
@@ -227,8 +256,14 @@ pub fn forget(dirs: &Dirs, name: &str) -> io::Result<()> {
     })
 }
 
-fn write_machines(dirs: &Dirs, names: &[String]) -> io::Result<()> {
-    let text: String = names.iter().map(|name| format!("{name}\n")).collect();
+fn write_machines(dirs: &Dirs, entries: &[Entry]) -> io::Result<()> {
+    let text: String = entries
+        .iter()
+        .map(|entry| match entry.parent.as_str() {
+            "" => format!("{}\n", entry.name),
+            parent => format!("{}\t{parent}\n", entry.name),
+        })
+        .collect();
     write_atomic(&ledger_path(dirs), text.as_bytes(), 0o644)
 }
 
@@ -423,6 +458,16 @@ mod tests {
         remember(&dirs, "herd-a").unwrap();
         remember(&dirs, "herd-b").unwrap();
         assert_eq!(machines(&dirs), ["herd-a", "herd-b"]);
+        fs::write(ledger_path(&dirs), "herd-a\nherd-c\thb-master\n").unwrap();
+        assert_eq!(
+            entries(&dirs)[1],
+            Entry {
+                name: "herd-c".into(),
+                parent: "hb-master".into()
+            }
+        );
+        forget(&dirs, "herd-c").unwrap();
+        remember(&dirs, "herd-b").unwrap();
         let agent = Agent {
             name: "fixer".into(),
             machine: "herd-a".into(),

@@ -1,6 +1,6 @@
 id = "boxd.session"
 name = "Boxd"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.1"
 description = "Start boxd machines from a snapshot, connect them in Herdr, and run subagents in them"
 platforms = ["linux", "macos"]

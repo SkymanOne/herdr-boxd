@@ -538,10 +538,22 @@ fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// True inside a boxd VM, where there is no boxd daemon or login.
+pub fn in_vm() -> bool {
+    vm_hint()
+}
+
+/// `boxd machine exec` sets only the lowercase names.
 fn vm_hint() -> bool {
-    ["BOXD_VM_ID", "BOXD_VM_NAME", "BOXD_PROXY_ENDPOINT"]
-        .into_iter()
-        .any(|name| nonempty_env(name).is_some())
+    [
+        "BOXD_VM_ID",
+        "BOXD_VM_NAME",
+        "BOXD_PROXY_ENDPOINT",
+        "boxd_vm_id",
+        "boxd_vm_name",
+    ]
+    .into_iter()
+    .any(|name| nonempty_env(name).is_some())
 }
 
 fn exchanged(source: &'static str, api_key: &str) -> Result<Credential> {
