@@ -125,11 +125,11 @@ pub fn profiles() -> Result<Vec<Profile>> {
 
 /// Adds the Herdr profile unless one already exists. Re-adding would create a
 /// duplicate profile.
-pub fn ensure_profile(name: &str) -> Result<String> {
+pub async fn ensure_profile(name: &str) -> Result<String> {
     if let Some(id) = profile_id(name)? {
         return Ok(id);
     }
-    let mut cmd = Command::new(bin());
+    let mut cmd = tokio::process::Command::new(bin());
     cmd.args([
         "machine",
         "add",
@@ -141,10 +141,26 @@ pub fn ensure_profile(name: &str) -> Result<String> {
     ]);
     // Keep stdout clean for --json callers; herdr's progress goes to stderr.
     cmd.stdout(std::io::stderr());
-    if !ui::interactive() {
+    cmd.kill_on_drop(true);
+    if ui::interactive() {
+        cmd.stdin(Stdio::inherit());
+    } else {
         cmd.stdin(Stdio::null());
     }
-    let status = cmd.status().context("run `herdr machine add`")?;
+    let mut child = cmd.spawn().context("run `herdr machine add`")?;
+    let status = match tokio::time::timeout(Duration::from_secs(120), child.wait()).await {
+        Ok(status) => status.context("run `herdr machine add`")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!(Coded::new(
+                "timeout",
+                format!(
+                    "herdr machine add {} timed out after 120s",
+                    ssh::alias(name)
+                ),
+            ));
+        }
+    };
     if !status.success() {
         bail!(Coded::new(
             "herdr_failed",

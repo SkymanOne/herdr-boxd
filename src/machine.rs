@@ -149,7 +149,15 @@ pub async fn start(client: &mut boxd::Client, plan: &Plan) -> Result<Ready> {
     };
     if plan.packed.is_some() {
         if let Some(profile) = &ready.profile {
-            open_project_shell(profile, &ready.workdir).await;
+            tokio::select! {
+                () = open_project_shell(profile, &ready.workdir) => {}
+                () = interrupted() => {
+                    ui::warn(format!(
+                        "interrupted while opening a shell in {}; {} is ready",
+                        ready.workdir, ready.machine
+                    ));
+                }
+            }
         }
     }
     Ok(ready)
@@ -212,7 +220,7 @@ pub async fn provision(
         ui::step("waiting for SSH");
         connect_ssh(client, &name, &vm).await?;
         ui::step(format!("adding {name} to Herdr"));
-        let profile = herdr::ensure_profile(&name)?;
+        let profile = herdr::ensure_profile(&name).await?;
         if let Some(created) = created.as_mut() {
             created.profile = true;
         }
@@ -293,7 +301,7 @@ pub async fn attach(client: &mut boxd::Client, name: &str) -> Result<String> {
     herdr::require_min()?;
     let vm = client.ensure_running(name).await?;
     connect_ssh(client, name, &vm).await?;
-    let profile = herdr::ensure_profile(name)?;
+    let profile = herdr::ensure_profile(name).await?;
     herdr::wait_reachable(&profile, Duration::from_secs(60)).await?;
     Ok(profile)
 }

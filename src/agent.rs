@@ -760,7 +760,7 @@ async fn pane_statuses(profile: &str) -> Result<HashMap<String, String>> {
         .flatten()
         .filter_map(|a| {
             Some((
-                herdr_agent_name(a)?.to_owned(),
+                a["name"].as_str()?.to_owned(),
                 a["agent_status"].as_str().unwrap_or("unknown").to_owned(),
             ))
         })
