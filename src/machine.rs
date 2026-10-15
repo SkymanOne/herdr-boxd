@@ -103,6 +103,10 @@ pub struct Ready {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub workdir: String,
+    /// Workspaces restored from the snapshot, seen right after
+    /// `herdr machine add`; closed later only if still untouched.
+    #[serde(skip)]
+    pub home_workspaces: Vec<String>,
 }
 
 /// A machine that exists but is not fully set up yet; `rollback` removes it.
@@ -148,7 +152,7 @@ pub async fn start(client: &mut boxd::Client, plan: &Plan) -> Result<Ready> {
     if plan.packed.is_some() {
         if let Some(profile) = &ready.profile {
             tokio::select! {
-                () = open_project_shell(profile, &ready.workdir) => {}
+                () = open_project_shell(profile, &ready.workdir, &ready.home_workspaces) => {}
                 () = interrupted() => {
                     ui::warn(format!(
                         "interrupted while opening a shell in {}; {} is ready",
@@ -221,6 +225,11 @@ pub async fn provision(
         None
     };
 
+    // Before the user can touch them: only these may be tidied away later.
+    let home_workspaces = match (&profile, &plan.packed) {
+        (Some(profile), Some(_)) => workspace_ids(profile).await,
+        _ => Vec::new(),
+    };
     let workdir = match &plan.packed {
         Some(packed) => copy::push(client, &name, packed).await?,
         None => "/home/boxd".to_owned(),
@@ -231,6 +240,7 @@ pub async fn provision(
         size: size_label(vm.vcpu, vm.memory_bytes),
         profile,
         workdir,
+        home_workspaces,
     })
 }
 
@@ -446,24 +456,110 @@ pub async fn list(client: &mut boxd::Client) -> Result<Vec<Listed>> {
         .collect())
 }
 
-pub async fn open_project_shell(profile: &str, workdir: &str) {
+/// Opens the project's workspace, then closes the snapshot's leftover home
+/// workspaces that nobody has used.
+pub async fn open_project_shell(profile: &str, workdir: &str, home_workspaces: &[String]) {
     if profile.is_empty() {
         return;
     }
-    if let Err(err) = focus_project_shell(profile, workdir).await {
-        ui::warn(format!("could not open a shell in {workdir}: {err:#}"));
+    match focus_project_shell(profile, workdir).await {
+        Ok(project) => {
+            for id in home_workspaces.iter().filter(|id| **id != project) {
+                close_if_untouched(profile, id).await;
+            }
+        }
+        Err(err) => ui::warn(format!("could not open a shell in {workdir}: {err:#}")),
     }
 }
 
-async fn focus_project_shell(profile: &str, workdir: &str) -> Result<()> {
+async fn focus_project_shell(profile: &str, workdir: &str) -> Result<String> {
     ui::step(format!("opening a shell in {workdir}"));
     herdr::wait_reachable(profile, Duration::from_secs(60)).await?;
     let label = workdir
         .rsplit('/')
         .find(|part| !part.is_empty())
         .unwrap_or(workdir);
-    herdr::create_workspace(profile, workdir, label, true).await?;
-    Ok(())
+    let (workspace, _) = herdr::create_workspace(profile, workdir, label, true).await?;
+    Ok(workspace)
+}
+
+/// Workspace ids on the machine now; empty if Herdr does not answer.
+async fn workspace_ids(profile: &str) -> Vec<String> {
+    let Ok(reply) =
+        herdr::remote_timeout(profile, &["workspace", "list"], Duration::from_secs(20)).await
+    else {
+        return Vec::new();
+    };
+    reply["result"]["workspaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["workspace_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Closes `workspace` only if it is still exactly what the snapshot restored:
+/// one tab, one pane in /home/boxd, no agent, and the shell idle. Any doubt or
+/// error leaves it open.
+async fn close_if_untouched(profile: &str, workspace: &str) {
+    let limit = Duration::from_secs(20);
+    let Ok(info) = herdr::remote_timeout(profile, &["workspace", "get", workspace], limit).await
+    else {
+        return;
+    };
+    let Ok(panes) =
+        herdr::remote_timeout(profile, &["pane", "list", "--workspace", workspace], limit).await
+    else {
+        return;
+    };
+    let Some(pane) = sole_home_pane(&info["result"]["workspace"], &panes["result"]["panes"]) else {
+        return;
+    };
+    let Ok(process) =
+        herdr::remote_timeout(profile, &["pane", "process-info", "--pane", &pane], limit).await
+    else {
+        return;
+    };
+    if !shell_idle(&process["result"]["process_info"]) {
+        return;
+    }
+    if herdr::remote_timeout(profile, &["workspace", "close", workspace], limit)
+        .await
+        .is_ok()
+    {
+        ui::step(format!("closed the unused home workspace {workspace}"));
+    }
+}
+
+const HOME: &str = "/home/boxd";
+
+/// The pane id when the workspace has one tab and one pane, in the home
+/// directory, with no agent.
+fn sole_home_pane(workspace: &serde_json::Value, panes: &serde_json::Value) -> Option<String> {
+    let panes = panes.as_array()?;
+    if workspace["tab_count"] != 1 || workspace["pane_count"] != 1 || panes.len() != 1 {
+        return None;
+    }
+    let pane = &panes[0];
+    let no_agent = pane["agent"].as_str().is_none_or(str::is_empty)
+        && pane["agent_status"].as_str().is_none_or(|s| s == "unknown");
+    let home = pane["cwd"] == HOME && pane["foreground_cwd"].as_str().is_none_or(|c| c == HOME);
+    (no_agent && home)
+        .then(|| pane["pane_id"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+/// True when the only foreground process is the pane's own shell.
+fn shell_idle(info: &serde_json::Value) -> bool {
+    let Some(shell) = info["shell_pid"].as_u64() else {
+        return false;
+    };
+    let Some(procs) = info["foreground_processes"].as_array() else {
+        return false;
+    };
+    info["foreground_process_group_id"].as_u64() == Some(shell)
+        && !procs.is_empty()
+        && procs.iter().all(|p| p["pid"].as_u64() == Some(shell))
 }
 
 pub async fn save_snapshot(client: &mut boxd::Client, vm: &str, snapshot: &str) -> Result<u64> {
@@ -475,6 +571,33 @@ pub async fn save_snapshot(client: &mut boxd::Client, vm: &str, snapshot: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_workspace_is_closed_only_when_untouched() {
+        use serde_json::json;
+        let ws = json!({"tab_count": 1, "pane_count": 1});
+        let pane = json!({"pane_id": "w2:p1", "cwd": HOME, "foreground_cwd": HOME, "agent_status": "unknown"});
+        assert_eq!(
+            sole_home_pane(&ws, &json!([pane])).as_deref(),
+            Some("w2:p1")
+        );
+        let mut moved = pane.clone();
+        moved["cwd"] = json!("/home/boxd/app");
+        assert!(sole_home_pane(&ws, &json!([moved])).is_none());
+        let mut agent = pane.clone();
+        agent["agent"] = json!("claude");
+        assert!(sole_home_pane(&ws, &json!([agent])).is_none());
+        let split = json!({"tab_count": 1, "pane_count": 2});
+        assert!(sole_home_pane(&split, &json!([pane, pane])).is_none());
+
+        let idle = json!({"shell_pid": 439, "foreground_process_group_id": 439,
+            "foreground_processes": [{"pid": 439, "name": "bash"}]});
+        assert!(shell_idle(&idle));
+        let busy = json!({"shell_pid": 439, "foreground_process_group_id": 803,
+            "foreground_processes": [{"pid": 803, "name": "sleep"}]});
+        assert!(!shell_idle(&busy));
+        assert!(!shell_idle(&json!({})));
+    }
 
     #[test]
     fn machine_name_accepts_herdr_box() {

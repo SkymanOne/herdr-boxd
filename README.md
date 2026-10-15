@@ -62,7 +62,7 @@ The menu lists your plugin machines with their live status. Press a key; no Ente
 
 Start asks for a name (blank lets boxd pick one), a size (Enter gives 2 vCPU / 8 GB), and whether to copy the focused pane's project. Then it shows a summary. Nothing is created until you confirm.
 
-- **Copy** is git-aware. In a repo it sends tracked files, plus untracked files that aren't ignored, plus `.git`. Outside a repo it skips `target`, `node_modules`, `.venv`, and similar directories. It asks first if the upload is over 500 MB. It never copies `/` or your home directory. The shell opens in that directory, not `/home/boxd`.
+- **Copy** is git-aware. In a repo it sends tracked files, plus untracked files that aren't ignored, plus `.git`. Outside a repo it skips `target`, `node_modules`, `.venv`, and similar directories. It asks first if the upload is over 500 MB. It never copies `/` or your home directory. The shell opens in that directory, not `/home/boxd`. The snapshot's own `~` workspace is closed if nobody has touched it: one idle shell in `/home/boxd`, no agent.
 - **Size.** A snapshot restore keeps the snapshot's size. Any other size costs one quick reboot.
 - **Hostname.** If the size already matches, there is no reboot. The plugin restarts the machine's Herdr server instead, so shells that were restored from the snapshot pick up the new hostname.
 - **If anything fails, or you close the popup or press Ctrl-C** after the machine exists, the plugin destroys it again. You never pay for a half-set-up machine.
