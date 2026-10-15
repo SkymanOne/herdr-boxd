@@ -235,6 +235,7 @@ async fn launch(
             ready.profile.unwrap_or_default()
         }
     };
+    let copied = packed.is_some();
     agent.workdir = match &packed {
         Some(packed) => copy::push(client, &agent.machine, packed).await?,
         None => workdir.unwrap_or_else(|| "/home/boxd".into()),
@@ -246,6 +247,9 @@ async fn launch(
         )
         .await?
         .check("creating the work directory")?;
+    if opts.machine.is_none() && copied {
+        machine::open_project_shell(&profile, &agent.workdir).await;
+    }
     let status = match agent.mode {
         Mode::Pane => spawn_pane(client, &profile, opts, agent).await?,
         Mode::Headless => spawn_headless(client, opts, agent).await?,

@@ -13,7 +13,7 @@ runs coding agents inside them. Every command takes `--json`; use it always.
 - Progress lines go to stderr; ignore them or show them to the user.
 
 Check it is installed with `herdr-boxd --version`. It needs a `boxd auth login`
-(or `herdr-boxd config set api-key`). Pane mode also needs Herdr 0.9+ on this
+(or `herdr-boxd config set api-key`). Pane mode also needs Herdr 0.9.1 or newer on this
 computer; headless mode works without Herdr, from any shell or CI.
 
 ## Two modes

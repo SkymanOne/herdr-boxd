@@ -2,6 +2,8 @@
 name = "herdr-boxd"
 version = "0.1.0"
 edition = "2021"
+authors = ["Gherman Nicolisin <git@nikolish.in>"]
+license = "MIT"
 
 [[bin]]
 name = "herdr-boxd"

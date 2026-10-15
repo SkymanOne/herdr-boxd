@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::boxd::{self, proto::GetVmResponse};
 use crate::copy::{self, Packed};
@@ -214,6 +215,11 @@ pub async fn provision(
         Some(packed) => copy::push(client, &name, packed).await?,
         None => "/home/boxd".to_owned(),
     };
+    if plan.packed.is_some() {
+        if let Some(profile) = &profile {
+            open_project_shell(profile, &workdir).await;
+        }
+    }
     *created = None;
     Ok(Ready {
         machine: name,
@@ -345,6 +351,79 @@ pub async fn list(client: &mut boxd::Client) -> Result<Vec<Listed>> {
         .collect())
 }
 
+pub async fn open_project_shell(profile: &str, workdir: &str) {
+    if profile.is_empty() || is_home_cwd(workdir) {
+        return;
+    }
+    if let Err(err) = replace_home_shell(profile, workdir).await {
+        ui::warn(format!("could not open a shell in {workdir}: {err:#}"));
+    }
+}
+
+async fn replace_home_shell(profile: &str, workdir: &str) -> Result<()> {
+    ui::step(format!("opening a shell in {workdir}"));
+    herdr::wait_reachable(profile, Duration::from_secs(60)).await?;
+    let label = workdir.rsplit('/').next().unwrap_or("code");
+    let created = herdr::remote(
+        profile,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            workdir,
+            "--label",
+            label,
+            "--no-focus",
+        ],
+    )
+    .await?;
+    let keep = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .context("herdr workspace create returned no workspace id")?;
+    let listed = herdr::remote(profile, &["pane", "list"]).await?;
+    let panes = listed["result"]["panes"]
+        .as_array()
+        .context("herdr pane list returned no panes")?;
+    for id in home_workspaces_to_close(panes, keep) {
+        if let Err(err) = herdr::remote(profile, &["workspace", "close", &id]).await {
+            ui::warn(format!("could not close the home shell {id}: {err:#}"));
+        }
+    }
+    Ok(())
+}
+
+/// Workspaces whose panes are all still in `/home/boxd`, excluding `keep`.
+fn home_workspaces_to_close(panes: &[Value], keep: &str) -> Vec<String> {
+    let mut all_home: HashMap<&str, bool> = HashMap::new();
+    for pane in panes {
+        let Some(id) = pane.get("workspace_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id == keep {
+            continue;
+        }
+        let home = pane
+            .get("cwd")
+            .and_then(Value::as_str)
+            .is_some_and(is_home_cwd);
+        all_home
+            .entry(id)
+            .and_modify(|flag| *flag &= home)
+            .or_insert(home);
+    }
+    let mut ids: Vec<String> = all_home
+        .into_iter()
+        .filter(|(_, home)| *home)
+        .map(|(id, _)| id.to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn is_home_cwd(cwd: &str) -> bool {
+    cwd.trim_end_matches('/') == "/home/boxd"
+}
+
 pub async fn save_snapshot(client: &mut boxd::Client, vm: &str, snapshot: &str) -> Result<u64> {
     client.ensure_running(vm).await?;
     ui::step(format!("saving {vm} as snapshot {snapshot}"));
@@ -373,5 +452,22 @@ mod tests {
         assert_eq!(parse_size("2x8").unwrap(), DEFAULT_SIZE);
         assert_eq!(parse_size("4x16G").unwrap().vcpu, 4);
         assert!(parse_size("3x12").is_err());
+    }
+
+    #[test]
+    fn only_all_home_workspaces_are_closed() {
+        let panes = serde_json::json!([
+            {"workspace_id": "w1", "cwd": "/home/boxd"},
+            {"workspace_id": "w1", "cwd": "/home/boxd/"},
+            {"workspace_id": "w2", "cwd": "/home/boxd/app"},
+            {"workspace_id": "w3", "cwd": "/home/boxd"},
+            {"workspace_id": "w4", "cwd": "/home/boxd"},
+            {"workspace_id": "w4", "cwd": "/tmp"},
+            {"workspace_id": "w5"}
+        ]);
+        assert_eq!(
+            home_workspaces_to_close(panes.as_array().unwrap(), "w3"),
+            vec!["w1".to_owned()]
+        );
     }
 }
