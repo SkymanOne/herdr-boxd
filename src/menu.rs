@@ -246,20 +246,40 @@ fn configure() -> Result<()> {
     Ok(())
 }
 
-/// Number keys pick from up to nine machines; Esc cancels.
-fn pick(names: &[String], verb: &str) -> Result<String> {
+/// What a picker lists, for its wording.
+#[derive(Clone, Copy)]
+enum Noun {
+    Machine,
+    Agent,
+}
+
+impl Noun {
+    fn question(self, verb: &str) -> String {
+        match self {
+            Noun::Machine => format!("Which machine to {verb}?"),
+            Noun::Agent => format!("Which agent to {verb}?"),
+        }
+    }
+
+    fn none(self, verb: &str) -> String {
+        match self {
+            Noun::Machine => format!("no plugin machines to {verb}"),
+            Noun::Agent => format!("no agents to {verb}"),
+        }
+    }
+}
+
+/// Number keys pick from up to nine names; Esc cancels.
+fn pick(names: &[String], noun: Noun, verb: &str) -> Result<String> {
     match names {
-        [] => bail!(Coded::new(
-            "not_found",
-            format!("no plugin machines to {verb}")
-        )),
+        [] => bail!(Coded::new("not_found", noun.none(verb))),
         [only] => return Ok(only.clone()),
         _ => {}
     }
     for (i, name) in names.iter().enumerate().take(9) {
         ui::out(format!("  {}  {name}", ui::bold(i + 1)));
     }
-    eprint!("{} ", ui::bold(format!("Which machine to {verb}?")));
+    eprint!("{} ", ui::bold(noun.question(verb)));
     loop {
         match ui::read_key()? {
             Key::Cancel => bail!(Coded::new("cancelled", "cancelled")),
@@ -286,7 +306,7 @@ async fn update() -> Result<()> {
         "This replaces {snapshot}; every new session starts from it."
     )));
     ui::out("");
-    let name = pick(&store::machines(&dirs), "save")?;
+    let name = pick(&store::machines(&dirs), Noun::Machine, "save")?;
     if !ui::confirm(&format!("Overwrite {snapshot} with {name}?"), false)? {
         bail!(Coded::new("cancelled", "cancelled"));
     }
@@ -302,7 +322,7 @@ async fn destroy() -> Result<()> {
     ui::out(ui::bold("Destroy a machine"));
     ui::out(ui::dim("Only machines this plugin created are listed."));
     ui::out("");
-    let name = pick(&store::machines(&dirs), "destroy")?;
+    let name = pick(&store::machines(&dirs), Noun::Machine, "destroy")?;
     let agents = store::agents(&dirs)
         .iter()
         .filter(|a| a.machine == name)
@@ -360,7 +380,7 @@ async fn agents() -> Result<()> {
                     .iter()
                     .filter_map(|v| v["agent"].as_str().map(str::to_owned))
                     .collect();
-                let name = match pick(&names, "stop") {
+                let name = match pick(&names, Noun::Agent, "stop") {
                     Ok(name) => name,
                     Err(_) => continue,
                 };
@@ -430,5 +450,29 @@ pub fn print_agent(value: &Value) {
     ui::out(agent_line(value));
     if let Some(detail) = value.get("detail") {
         ui::out(format!("  {}", ui::dim(detail)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pickers_name_what_they_list() {
+        assert_eq!(Noun::Agent.question("stop"), "Which agent to stop?");
+        assert_eq!(
+            Noun::Machine.question("destroy"),
+            "Which machine to destroy?"
+        );
+        assert_eq!(Noun::Agent.none("stop"), "no agents to stop");
+        assert_eq!(Noun::Machine.none("save"), "no plugin machines to save");
+    }
+
+    #[test]
+    fn pick_reports_an_empty_list_in_its_own_words() {
+        let err = pick(&[], Noun::Agent, "stop").unwrap_err();
+        assert_eq!(err.to_string(), "no agents to stop");
+        let only = pick(&["a".to_owned()], Noun::Agent, "stop").unwrap();
+        assert_eq!(only, "a");
     }
 }
